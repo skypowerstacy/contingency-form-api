@@ -67,7 +67,7 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
     `;
 
     await resend.emails.send({
-      from: 'NuHome Forms <noreply@thenuhome.com>',
+      from: 'NuHome Forms <noreply@thehiveoffice.com>',
       to: ['stacy@thenuhome.com'],
       subject: `Contingency Form — ${repName.trim()} — ${new Date().toLocaleDateString('en-US', { timeZone: 'America/Denver' })}`,
       html: emailHtml,
