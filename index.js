@@ -4,7 +4,7 @@ const { Resend } = require('resend');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -83,5 +83,5 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Contingency form API running on port ${PORT}`);
+  console.log(`Contingency form API running on port ${PORT} ✓`);
 });
