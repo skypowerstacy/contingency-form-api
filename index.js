@@ -29,7 +29,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.post('/submit', upload.array('files', 10), async (req, res) => {
   try {
-    const { repName, submittedAt } = req.body;
+    const { repName, customerName, submittedAt } = req.body;
     const files = req.files;
 
     if (!files || files.length === 0) {
@@ -38,6 +38,10 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
 
     if (!repName || repName.trim() === '') {
       return res.status(400).json({ error: 'Rep name is required.' });
+    }
+
+    if (!customerName || customerName.trim() === '') {
+      return res.status(400).json({ error: 'Customer name is required.' });
     }
 
     // Build attachments for Resend
@@ -56,6 +60,7 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
           <h1 style="color: #f97316; margin: 0; font-size: 20px;">NuHome — Contingency Form Submission</h1>
         </div>
         <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px;">
+          <p style="margin: 0 0 12px;"><strong>Customer:</strong> ${customerName.trim()}</p>
           <p style="margin: 0 0 12px;"><strong>Rep:</strong> ${repName.trim()}</p>
           <p style="margin: 0 0 12px;"><strong>Submitted:</strong> ${submittedDate}</p>
           <p style="margin: 0 0 12px;"><strong>Pages attached:</strong> ${files.length}</p>
@@ -69,7 +74,7 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
     await resend.emails.send({
       from: 'NuHome Forms <noreply@thehiveoffice.com>',
       to: ['stacy@thenuhome.com'],
-      subject: `Contingency Form — ${repName.trim()} — ${new Date().toLocaleDateString('en-US', { timeZone: 'America/Denver' })}`,
+      subject: `Contingency Form — ${customerName.trim()} — ${new Date().toLocaleDateString('en-US', { timeZone: 'America/Denver' })}`,
       html: emailHtml,
       attachments,
     });
