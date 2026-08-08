@@ -28,7 +28,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.post('/submit', upload.array('files', 10), async (req, res) => {
   try {
-    const { repName, customerName, submittedAt } = req.body;
+    const { repName, customerName, submittedAt, adjusterMeetingDate } = req.body;
     const files = req.files;
 
     if (!files || files.length === 0) {
@@ -50,6 +50,17 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       ? new Date(submittedAt).toLocaleString('en-US', { timeZone: 'America/Denver', dateStyle: 'full', timeStyle: 'short' })
       : new Date().toLocaleString('en-US', { timeZone: 'America/Denver', dateStyle: 'full', timeStyle: 'short' });
 
+    // The form sends a date-only YYYY-MM-DD value, which Date parses as UTC
+    // midnight — formatting that in America/Denver would render the day before.
+    // Hence UTC here, unlike submittedDate above, which is a real instant.
+    const meetingDate = (adjusterMeetingDate || '').trim();
+    const parsedMeeting = meetingDate ? new Date(`${meetingDate}T00:00:00Z`) : null;
+    const adjusterMeetingDisplay = !meetingDate
+      ? 'Not provided'
+      : parsedMeeting && !isNaN(parsedMeeting.getTime())
+        ? parsedMeeting.toLocaleDateString('en-US', { timeZone: 'UTC', dateStyle: 'full' })
+        : meetingDate;
+
     const emailHtml = `
       <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
         <div style="background: #1a1a2e; padding: 24px; border-radius: 8px 8px 0 0;">
@@ -57,6 +68,7 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
         </div>
         <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px;">
           <p style="margin: 0 0 12px;"><strong>Customer:</strong> ${customerName.trim()}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Meeting Date:</strong> ${adjusterMeetingDisplay}</p>
           <p style="margin: 0 0 12px;"><strong>Rep:</strong> ${repName.trim()}</p>
           <p style="margin: 0 0 12px;"><strong>Submitted:</strong> ${submittedDate}</p>
           <p style="margin: 0 0 12px;"><strong>Pages attached:</strong> ${files.length}</p>
