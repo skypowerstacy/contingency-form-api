@@ -45,17 +45,38 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.post('/submit', upload.array('files', 10), async (req, res) => {
   try {
-    const { repName, customerName, submittedAt, adjusterMeetingDate } = req.body;
+    const {
+      repName,
+      customerName,
+      propertyAddress,
+      insuranceCarrier,
+      claimNumber,
+      adjusterName,
+      adjusterPhone,
+      adjusterEmail,
+      adjusterAppointment,
+      submittedAt,
+    } = req.body;
     const files = req.files;
 
     if (!files || files.length === 0) {
       return res.status(400).json({ error: 'At least one file is required.' });
     }
-    if (!repName || repName.trim() === '') {
-      return res.status(400).json({ error: 'Rep name is required.' });
-    }
-    if (!customerName || customerName.trim() === '') {
-      return res.status(400).json({ error: 'Customer name is required.' });
+
+    const required = [
+      [repName, 'Rep name'],
+      [customerName, 'Customer name'],
+      [propertyAddress, 'Property address'],
+      [insuranceCarrier, 'Insurance carrier'],
+      [claimNumber, 'Claim number'],
+      [adjusterName, 'Adjuster name'],
+      [adjusterPhone, 'Adjuster phone'],
+    ];
+
+    for (const [value, label] of required) {
+      if (!value || value.trim() === '') {
+        return res.status(400).json({ error: `${label} is required.` });
+      }
     }
 
     // Deliberately NOT escapeHtml'd: this is an attachment filename, not an
@@ -71,16 +92,33 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       ? new Date(submittedAt).toLocaleString('en-US', { timeZone: 'America/Denver', dateStyle: 'full', timeStyle: 'short' })
       : new Date().toLocaleString('en-US', { timeZone: 'America/Denver', dateStyle: 'full', timeStyle: 'short' });
 
-    // The form sends a date-only YYYY-MM-DD value, which Date parses as UTC
-    // midnight — formatting that in America/Denver would render the day before.
-    // Hence UTC here, unlike submittedDate above, which is a real instant.
-    const meetingDate = (adjusterMeetingDate || '').trim();
-    const parsedMeeting = meetingDate ? new Date(`${meetingDate}T00:00:00Z`) : null;
-    const adjusterMeetingDisplay = !meetingDate
-      ? 'Not provided'
-      : parsedMeeting && !isNaN(parsedMeeting.getTime())
-        ? parsedMeeting.toLocaleDateString('en-US', { timeZone: 'UTC', dateStyle: 'full' })
-        : meetingDate;
+    const adjusterEmailDisplay = (adjusterEmail || '').trim() || 'Not provided';
+
+    /*
+     * The datetime-local input sends a wall-clock value with no offset, e.g.
+     * "2026-08-20T14:30" — the rep means 2:30 PM Denver. Node would parse that
+     * in the server's own zone (UTC on Railway), so formatting it in
+     * America/Denver would shift it back six hours and print 8:30 AM.
+     *
+     * Pinning the value to UTC and formatting in UTC therefore prints exactly
+     * the wall clock the rep typed, which is the Denver time they meant. Same
+     * reasoning as the date-only field this replaces: a wall-clock value has
+     * to be rendered verbatim, not converted. submittedDate above is different
+     * — it is a real instant, so it genuinely converts to Denver.
+     */
+    const appointment = (adjusterAppointment || '').trim();
+    // datetime-local omits seconds unless they are non-zero.
+    const appointmentUtc = appointment.length === 16 ? `${appointment}:00Z` : `${appointment}Z`;
+    const parsedAppointment = appointment ? new Date(appointmentUtc) : null;
+    const adjusterAppointmentDisplay = !appointment
+      ? 'Not scheduled'
+      : parsedAppointment && !isNaN(parsedAppointment.getTime())
+        ? parsedAppointment.toLocaleString('en-US', {
+            timeZone: 'UTC',
+            dateStyle: 'full',
+            timeStyle: 'short',
+          })
+        : appointment;
 
     const emailHtml = `
       <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
@@ -89,7 +127,13 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
         </div>
         <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px;">
           <p style="margin: 0 0 12px;"><strong>Customer:</strong> ${escapeHtml(customerName.trim())}</p>
-          <p style="margin: 0 0 12px;"><strong>Adjuster Meeting Date:</strong> ${escapeHtml(adjusterMeetingDisplay)}</p>
+          <p style="margin: 0 0 12px;"><strong>Property Address:</strong> ${escapeHtml(propertyAddress.trim())}</p>
+          <p style="margin: 0 0 12px;"><strong>Insurance Carrier:</strong> ${escapeHtml(insuranceCarrier.trim())}</p>
+          <p style="margin: 0 0 12px;"><strong>Claim Number:</strong> ${escapeHtml(claimNumber.trim())}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Name:</strong> ${escapeHtml(adjusterName.trim())}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Phone:</strong> ${escapeHtml(adjusterPhone.trim())}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Email:</strong> ${escapeHtml(adjusterEmailDisplay)}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Appointment:</strong> ${escapeHtml(adjusterAppointmentDisplay)}</p>
           <p style="margin: 0 0 12px;"><strong>Rep:</strong> ${escapeHtml(repName.trim())}</p>
           <p style="margin: 0 0 12px;"><strong>Submitted:</strong> ${escapeHtml(submittedDate)}</p>
           <p style="margin: 0 0 12px;"><strong>Pages attached:</strong> ${files.length}</p>
