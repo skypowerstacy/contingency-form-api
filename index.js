@@ -4,6 +4,7 @@ const { Resend } = require('resend');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
+const archiver = require('archiver');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,6 +17,7 @@ const INSPECTION_PIPELINE = '2476304118';
 const INSPECTION_STAGE = '4130205409'; // Site Inspection
 const SUPABASE_PROJECT_REF = 'rfytaiowxtpmesqzoidz';
 const PHOTO_BUCKET = 'inspections';
+const PHOTO_ZIP_NAME = 'inspection-photos.zip';
 
 /*
  * Ops/Install. Sales deals live here and the Deals Dashboard reads from it —
@@ -356,6 +358,30 @@ async function createInspectionDeal(fields, contactId) {
   return { dealId: deal.id, closerWarning };
 }
 
+/**
+ * Buffers every photo into a single in-memory zip, entries named
+ * {category}/{originalname}.
+ *
+ * Compression is level 1 on purpose: JPEG and HEIC are already compressed, so a
+ * higher level burns CPU on a container for a negligible size win.
+ */
+function zipPhotos(photos) {
+  return new Promise((resolve, reject) => {
+    const archive = archiver('zip', { zlib: { level: 1 } });
+    const chunks = [];
+
+    archive.on('data', chunk => chunks.push(chunk));
+    archive.on('warning', err => reject(err));
+    archive.on('error', err => reject(err));
+    archive.on('end', () => resolve(Buffer.concat(chunks)));
+
+    for (const photo of photos) {
+      archive.append(photo.buffer, { name: `${photo.category}/${photo.originalname || 'photo.jpg'}` });
+    }
+    archive.finalize();
+  });
+}
+
 async function uploadPhotos(dealId, photos) {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -391,10 +417,30 @@ async function uploadPhotos(dealId, photos) {
     else uploaded.push(path);
   }
 
-  const photosUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${dealId}/`;
+  // Zip failures must not discard the individual uploads that already
+  // succeeded, so this is caught separately from the loop above.
+  let photosUrl = null;
+  try {
+    const zipBuffer = await zipPhotos(photos);
+    console.log('Zip built:', zipBuffer.length, 'bytes from', photos.length, 'photos');
+
+    const zipPath = `${dealId}/${PHOTO_ZIP_NAME}`;
+    const { data, error } = await supabase.storage.from(PHOTO_BUCKET).upload(zipPath, zipBuffer, {
+      contentType: 'application/zip',
+      upsert: true,
+    });
+    console.log('Supabase zip upload result for', zipPath, '- data:', data, '- error:', error);
+
+    if (error) failed.push(`${zipPath}: ${error.message}`);
+    else photosUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${zipPath}`;
+  } catch (err) {
+    console.error('Zip creation failed:', err);
+    failed.push(`${dealId}/${PHOTO_ZIP_NAME}: ${err.message}`);
+  }
+
   console.log('Photo upload complete, URL:', photosUrl);
 
-  return { uploaded, failed };
+  return { uploaded, failed, photosUrl };
 }
 
 function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes) {
@@ -501,8 +547,8 @@ app.post('/inspection', upload.any(), async (req, res) => {
     // Photos are keyed by deal id, so without one there is nowhere to put them.
     if (photos.length && dealId) {
       try {
-        const { failed } = await uploadPhotos(dealId, photos);
-        photosUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${dealId}/`;
+        const { failed, photosUrl: zipUrl } = await uploadPhotos(dealId, photos);
+        photosUrl = zipUrl;
         if (failed.length) {
           console.error('[inspection] photo uploads failed:', failed);
           notes.push(`${failed.length} of ${photos.length} photos failed to upload`);
