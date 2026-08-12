@@ -18,6 +18,10 @@ const INSPECTION_STAGE = '4130205409'; // Site Inspection
 const SUPABASE_PROJECT_REF = 'rfytaiowxtpmesqzoidz';
 const PHOTO_BUCKET = 'inspections';
 const PHOTO_ZIP_NAME = 'inspection-photos.zip';
+const CONTINGENCY_BUCKET = 'contingency';
+const CONTINGENCY_ZIP_NAME = 'contingency-form.zip';
+// Roofing - Insurance, the same pipeline INSPECTION_PIPELINE names.
+const CONTINGENCY_SIGNED_STAGE = '4109489900';
 
 /*
  * Ops/Install. Sales deals live here and the Deals Dashboard reads from it —
@@ -101,7 +105,162 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+// ---- Address handling (shared by /submit's storage path and deal lookup) ----
+
+const STREET_ABBREVIATIONS = {
+  st: 'street', ave: 'avenue', blvd: 'boulevard', dr: 'drive',
+  ln: 'lane', ct: 'court', rd: 'road',
+};
+
+/**
+ * Canonical form for comparison only: lowercased, punctuation stripped, common
+ * street abbreviations expanded, whitespace collapsed. "123 Main St." and
+ * "123 main street" both become "123 main street".
+ */
+function normaliseAddress(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(word => STREET_ABBREVIATIONS[word] || word)
+    .join(' ');
+}
+
+/** Storage-path-safe folder name. Slashes would silently create sub-folders. */
+function addressSlug(value) {
+  const slug = String(value || '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '_')
+    .replace(/[^\w.-]/g, '');
+  return slug || 'unknown-address';
+}
+
+/** Tolerates extra unit numbers, missing city, and abbreviation differences. */
+function addressesMatch(a, b) {
+  if (!a || !b) return false;
+  if (a === b || a.includes(b) || b.includes(a)) return true;
+
+  const left = new Set(a.split(' '));
+  const right = new Set(b.split(' '));
+  const shared = [...left].filter(token => right.has(token)).length;
+  return shared >= Math.min(left.size, right.size) * 0.8;
+}
+
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+/**
+ * Uploads each page individually, then a zip of all of them.
+ *
+ * Folder is the property address: the deal id is not known until the lookup
+ * below, which itself needs the zip URL, so the address is what we have.
+ */
+async function uploadContingencyFiles(slug, files) {
+  const supabase = createSupabaseClient();
+  const uploaded = [];
+  const failed = [];
+
+  console.log('[submit] uploading', files.length, 'file(s) to', `${CONTINGENCY_BUCKET}/${slug}/`);
+
+  for (const file of files) {
+    const safeName = String(file.originalname || 'page.pdf').replace(/[^\w.\-]/g, '_');
+    const path = `${slug}/${safeName}`;
+    const { error } = await supabase.storage.from(CONTINGENCY_BUCKET).upload(path, file.buffer, {
+      contentType: file.mimetype,
+      upsert: true,
+    });
+    if (error) failed.push(`${path}: ${error.message}`);
+    else uploaded.push(path);
+  }
+
+  // A zip failure must not discard the pages that already uploaded.
+  let zipUrl = null;
+  try {
+    const zipBuffer = await zipEntries(files.map((file, i) => ({
+      name: file.originalname || `contingency-page-${i + 1}.pdf`,
+      buffer: file.buffer,
+    })));
+    const zipPath = `${slug}/${CONTINGENCY_ZIP_NAME}`;
+    const { error } = await supabase.storage.from(CONTINGENCY_BUCKET).upload(zipPath, zipBuffer, {
+      contentType: 'application/zip',
+      upsert: true,
+    });
+    if (error) failed.push(`${zipPath}: ${error.message}`);
+    else zipUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${CONTINGENCY_BUCKET}/${zipPath}`;
+  } catch (err) {
+    failed.push(`${slug}/${CONTINGENCY_ZIP_NAME}: ${err.message}`);
+  }
+
+  console.log('[submit] storage done. uploaded:', uploaded.length, 'failed:', failed.length, 'zipUrl:', zipUrl);
+  return { uploaded, failed, zipUrl };
+}
+
+/**
+ * Finds the Roofing - Insurance deal for a property by matching the address on
+ * the associated contact.
+ *
+ * HubSpot search cannot express "roughly this address", so it is narrowed
+ * server-side on the street number (the most selective token) and the fuzzy
+ * comparison happens here.
+ */
+async function findDealByAddress(rawAddress) {
+  const target = normaliseAddress(rawAddress);
+  if (!target) return null;
+
+  const token = (target.match(/\d+/) || [])[0] || target.split(' ')[0];
+  if (!token) return null;
+
+  const search = await hubspot('/crm/v3/objects/contacts/search', {
+    method: 'POST',
+    body: JSON.stringify({
+      filterGroups: [{ filters: [{ propertyName: 'address', operator: 'CONTAINS_TOKEN', value: token }] }],
+      properties: ['address', 'firstname', 'lastname', 'email'],
+      limit: 100,
+    }),
+  });
+
+  const candidates = (search?.results || [])
+    .filter(c => addressesMatch(target, normaliseAddress(c.properties?.address)));
+
+  console.log('[submit] address lookup:', JSON.stringify(target), '- token:', token,
+    '- contacts searched:', (search?.results || []).length, '- address matches:', candidates.length);
+
+  for (const contact of candidates) {
+    const assoc = await hubspot(`/crm/v4/objects/contacts/${contact.id}/associations/deals`);
+    for (const row of assoc?.results || []) {
+      const dealId = String(row.toObjectId);
+      const deal = await hubspot(`/crm/v3/objects/deals/${dealId}?properties=pipeline,dealstage,dealname`);
+      const pipeline = String(deal?.properties?.pipeline || '');
+      if (pipeline === INSPECTION_PIPELINE) {
+        return { dealId, pipeline, contactId: contact.id, dealname: deal?.properties?.dealname };
+      }
+    }
+  }
+  return null;
+}
+
+async function updateContingencyDeal(deal, fields, zipUrl) {
+  // Asserted against the pipeline HubSpot actually reports for this deal, not
+  // against our own constant — so a deal in the forbidden pipeline can never be
+  // patched even if the lookup above were ever loosened.
+  assertPipelineAllowed(deal.pipeline);
+
+  const properties = { dealstage: CONTINGENCY_SIGNED_STAGE };
+  if (fields.claimNumber) properties.claim_number = fields.claimNumber;
+  if (fields.adjusterName) properties.adjuster_name = fields.adjusterName;
+  if (fields.adjusterPhone) properties.adjuster_phone = fields.adjusterPhone;
+  if (fields.adjusterEmail) properties.adjuster_email = fields.adjusterEmail;
+  if (fields.adjusterAppointment) properties.adjuster_meeting_date = fields.adjusterAppointment;
+  if (zipUrl) properties.contingency_form_url = zipUrl;
+
+  await hubspot(`/crm/v3/objects/deals/${deal.dealId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties }),
+  });
+
+  console.log('[submit] deal', deal.dealId, 'moved to Contingency Signed with', Object.keys(properties).join(', '));
+}
 
 app.post('/submit', upload.array('files', 10), async (req, res) => {
   try {
@@ -137,6 +296,40 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       if (!value || value.trim() === '') {
         return res.status(400).json({ error: `${label} is required.` });
       }
+    }
+
+    /*
+     * Storage and HubSpot are both best-effort: the email to ops is the part
+     * that must not be lost, so every failure below is collected as a warning
+     * and the request still succeeds.
+     */
+    const warnings = [];
+    const slug = addressSlug(propertyAddress);
+
+    let zipUrl = null;
+    try {
+      const result = await uploadContingencyFiles(slug, files);
+      zipUrl = result.zipUrl;
+      if (result.failed.length) {
+        console.error('[submit] storage failures:', result.failed);
+        warnings.push(`${result.failed.length} file(s) failed to upload to storage`);
+      }
+    } catch (err) {
+      console.error('[submit] Supabase upload failed:', err);
+      warnings.push('Files were not uploaded to storage');
+    }
+
+    try {
+      const deal = await findDealByAddress(propertyAddress);
+      if (deal) {
+        await updateContingencyDeal(deal, req.body, zipUrl);
+      } else {
+        console.warn('[submit] no Roofing - Insurance deal found for address:', propertyAddress);
+        warnings.push('No matching HubSpot deal found — nothing was updated');
+      }
+    } catch (err) {
+      console.error('[submit] HubSpot deal update failed:', err);
+      warnings.push('HubSpot deal was not updated');
     }
 
     // Deliberately NOT escapeHtml'd: this is an attachment filename, not an
@@ -212,7 +405,7 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       attachments,
     });
 
-    res.json({ success: true });
+    res.json({ success: true, ...(warnings.length ? { warnings } : {}) });
 
   } catch (err) {
     console.error('Submission error:', err);
@@ -358,14 +551,33 @@ async function createInspectionDeal(fields, contactId) {
   return { dealId: deal.id, closerWarning };
 }
 
-/**
- * Buffers every photo into a single in-memory zip, entries named
- * {category}/{originalname}.
+/*
+ * supabase-js constructs a RealtimeClient even when only storage is used, and
+ * on Node < 22 there is no global WebSocket — createClient throws outright.
+ * Supplying `ws` keeps it working regardless of the Node the platform picks.
  *
- * Compression is level 1 on purpose: JPEG and HEIC are already compressed, so a
- * higher level burns CPU on a container for a negligible size win.
+ * Built per call rather than at module scope on purpose: at module scope it
+ * would throw at boot whenever the Supabase env vars are unset, taking the
+ * whole service down instead of degrading to "files were not uploaded".
  */
-function zipPhotos(photos) {
+function createSupabaseClient() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set.');
+
+  return createClient(url, key, {
+    global: { fetch: fetch },
+    realtime: { transport: ws },
+  });
+}
+
+/**
+ * Buffers [{ name, buffer }] entries into a single in-memory zip.
+ *
+ * Compression is level 1 on purpose: JPEG, HEIC and PDF are already compressed,
+ * so a higher level burns CPU on a container for a negligible size win.
+ */
+function zipEntries(entries) {
   return new Promise((resolve, reject) => {
     const archive = archiver('zip', { zlib: { level: 1 } });
     const chunks = [];
@@ -375,30 +587,21 @@ function zipPhotos(photos) {
     archive.on('error', err => reject(err));
     archive.on('end', () => resolve(Buffer.concat(chunks)));
 
-    for (const photo of photos) {
-      archive.append(photo.buffer, { name: `${photo.category}/${photo.originalname || 'photo.jpg'}` });
-    }
+    for (const entry of entries) archive.append(entry.buffer, { name: entry.name });
     archive.finalize();
   });
 }
 
-async function uploadPhotos(dealId, photos) {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set.');
+/** Inspection photos are grouped into {category}/{originalname} inside the zip. */
+function zipPhotos(photos) {
+  return zipEntries(photos.map(p => ({
+    name: `${p.category}/${p.originalname || 'photo.jpg'}`,
+    buffer: p.buffer,
+  })));
+}
 
-  /*
-   * supabase-js constructs a RealtimeClient even when only storage is used, and
-   * on Node < 22 there is no global WebSocket — createClient throws outright.
-   * Supplying `ws` keeps it working regardless of the Node the platform picks.
-   * Left inside this function on purpose: at module scope it would throw at
-   * boot whenever the Supabase env vars are unset, taking the whole service
-   * down instead of degrading to "photos were not uploaded".
-   */
-  const supabase = createClient(url, key, {
-    global: { fetch: fetch },
-    realtime: { transport: ws },
-  });
+async function uploadPhotos(dealId, photos) {
+  const supabase = createSupabaseClient();
   console.log('Starting photo upload, file count:', photos.length);
 
   const uploaded = [];
