@@ -69,7 +69,11 @@ const upload = multer({
     if (allowed.includes(mimetype) || allowedExtension.test(file.originalname || '')) {
       cb(null, true);
     } else {
-      cb(new Error('Only JPG, PNG, HEIC, and PDF files are accepted.'));
+      // Not a MulterError, so the global handler cannot infer this is the
+      // caller's fault — tag it explicitly or it reports as a 500.
+      const err = new Error('Only JPG, PNG, HEIC, and PDF files are accepted.');
+      err.status = 400;
+      cb(err);
     }
   }
 });
