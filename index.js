@@ -332,6 +332,72 @@ async function updateContingencyDeal(deal, fields, zipUrl) {
   console.log('[submit] deal', deal.dealId, 'moved to Contingency Signed with', Object.keys(properties).join(', '));
 }
 
+/*
+ * The contingency form collects one free-text name, so the split is positional:
+ * first word is the first name, everything after it is the last name. That gets
+ * "Mary Anne Van Der Berg" wrong in the ways you would expect, but it beats
+ * dropping the surname, and ops can correct it in HubSpot.
+ */
+function splitCustomerName(value) {
+  const parts = String(value || '').trim().split(/\s+/).filter(Boolean);
+  return { fname: parts[0] || '', lname: parts.slice(1).join(' ') };
+}
+
+/**
+ * Creates the contact and deal when no existing deal matched the address.
+ *
+ * The contingency form has no email or phone, so the contact cannot be deduped
+ * — upsertContact always creates in that case. A rep who submits the same
+ * address twice without a deal existing yet therefore gets two contacts; the
+ * address lookup catches it from the second submission onward.
+ */
+async function createContingencyDeal(fields, zipUrl) {
+  assertPipelineAllowed(INSPECTION_PIPELINE);
+
+  const { fname, lname } = splitCustomerName(fields.customerName);
+  const contactId = await upsertContact({ fname, lname, address: fields.propertyAddress });
+
+  const properties = {
+    dealname: String(fields.customerName || '').trim() || 'Unknown homeowner',
+    pipeline: INSPECTION_PIPELINE,
+    dealstage: CONTINGENCY_SIGNED_STAGE,
+  };
+  if (fields.propertyAddress) properties.customers_full_address = fields.propertyAddress;
+  if (fields.insuranceCarrier) properties.insurance_company = fields.insuranceCarrier;
+  if (fields.claimNumber) properties.claim_number = fields.claimNumber;
+  if (fields.adjusterName) properties.adjuster_name = fields.adjusterName;
+  if (fields.adjusterPhone) properties.adjuster_phone = fields.adjusterPhone;
+  if (fields.adjusterEmail) properties.adjuster_email = fields.adjusterEmail;
+  // Already YYYY-MM-DD off the form's date input — same as updateContingencyDeal.
+  const meetingDate = (fields.adjusterAppointmentDate || '').toString().trim();
+  if (meetingDate) properties.adjuster_meeting_date = meetingDate;
+  if (zipUrl) properties.contingency_form_url = zipUrl;
+
+  let closerWarning = null;
+  try {
+    const closer = await resolveCloserOption(fields.repName);
+    if (closer) properties.closer = closer;
+    else if (fields.repName) closerWarning = `No "closer" option matched rep "${fields.repName}" — property omitted.`;
+  } catch (err) {
+    closerWarning = `Could not resolve "closer" options: ${err.message}`;
+  }
+
+  const deal = await hubspot('/crm/v3/objects/deals', {
+    method: 'POST',
+    body: JSON.stringify({ properties }),
+  });
+
+  if (contactId) {
+    await hubspot(
+      `/crm/v4/objects/deals/${deal.id}/associations/default/contacts/${contactId}`,
+      { method: 'PUT' }
+    );
+  }
+
+  console.log('[submit] created deal', deal.id, 'and contact', contactId, 'with', Object.keys(properties).join(', '));
+  return { dealId: deal.id, contactId, closerWarning };
+}
+
 app.post('/submit', upload.array('files', 10), async (req, res) => {
   try {
     const {
@@ -403,12 +469,16 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       if (deal) {
         await updateContingencyDeal(deal, req.body, zipUrl);
       } else {
-        console.warn('[submit] no Roofing - Insurance deal found for address:', propertyAddress);
-        warnings.push('No matching HubSpot deal found — nothing was updated');
+        console.warn('[submit] no Roofing - Insurance deal found for address:', propertyAddress, '— creating one');
+        const created = await createContingencyDeal(req.body, zipUrl);
+        if (created.closerWarning) {
+          console.warn('[submit]', created.closerWarning);
+          warnings.push(created.closerWarning);
+        }
       }
     } catch (err) {
-      console.error('[submit] HubSpot deal update failed:', err);
-      warnings.push('HubSpot deal was not updated');
+      console.error('[submit] HubSpot deal update/create failed:', err);
+      warnings.push('HubSpot deal was not created or updated');
     }
 
     // Deliberately NOT escapeHtml'd: this is an attachment filename, not an
