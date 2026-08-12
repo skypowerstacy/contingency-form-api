@@ -65,7 +65,6 @@ const upload = multer({
     const allowedExtension = /\.(jpe?g|png|heic|pdf)$/i;
 
     // Strip any parameters, e.g. "image/jpeg; charset=utf-8".
-    console.log('fileFilter received:', file.fieldname, file.mimetype, file.originalname);
     const mimetype = (file.mimetype || '').split(';')[0].trim();
 
     if (allowed.includes(mimetype) || allowedExtension.test(file.originalname || '')) {
@@ -374,19 +373,26 @@ async function uploadPhotos(dealId, photos) {
     global: { fetch: fetch },
     realtime: { transport: ws },
   });
+  console.log('Starting photo upload, file count:', photos.length);
+
   const uploaded = [];
   const failed = [];
 
   for (const photo of photos) {
+    console.log('Uploading photo:', photo.fieldname, photo.originalname, photo.buffer?.length, 'bytes');
     const safeName = String(photo.originalname || 'photo.jpg').replace(/[^\w.\-]/g, '_');
     const path = `${dealId}/${photo.category}/${safeName}`;
-    const { error } = await supabase.storage.from(PHOTO_BUCKET).upload(path, photo.buffer, {
+    const { data, error } = await supabase.storage.from(PHOTO_BUCKET).upload(path, photo.buffer, {
       contentType: photo.mimetype,
       upsert: true,
     });
+    console.log('Supabase upload result for', path, '- data:', data, '- error:', error);
     if (error) failed.push(`${path}: ${error.message}`);
     else uploaded.push(path);
   }
+
+  const photosUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${dealId}/`;
+  console.log('Photo upload complete, URL:', photosUrl);
 
   return { uploaded, failed };
 }
