@@ -44,8 +44,29 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/jpg', 'image/heic', 'image/heif', 'application/pdf'];
-    if (allowed.includes(file.mimetype)) {
+    const allowed = [
+      'image/jpeg',
+      'image/jpg',
+      'image/png',
+      'image/heic',
+      'image/heif',
+      'image/heif-sequence',
+      'image/heic-sequence',
+      'application/pdf',
+    ];
+
+    /*
+     * Browsers disagree on HEIC in particular — the same photo off an iPhone can
+     * arrive as image/heic, application/octet-stream, or an empty mimetype
+     * depending on the browser. Falling back to the extension means a rep does
+     * not lose a legitimate roof photo to a header we cannot control.
+     */
+    const allowedExtension = /\.(jpe?g|png|heic|pdf)$/i;
+
+    // Strip any parameters ("image/jpeg; charset=…") and normalise case.
+    const mimetype = String(file.mimetype || '').toLowerCase().split(';')[0].trim();
+
+    if (allowed.includes(mimetype) || allowedExtension.test(file.originalname || '')) {
       cb(null, true);
     } else {
       cb(new Error('Only JPG, PNG, HEIC, and PDF files are accepted.'));
