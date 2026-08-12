@@ -453,6 +453,10 @@ app.post('/inspection', upload.any(), async (req, res) => {
   let dealId = null;
   let photosUrl = null;
 
+  console.log('[inspection] raw body keys:', Object.keys(req.body || {}));
+  console.log('[inspection] raw body values:', JSON.stringify(req.body || {}));
+  console.log('[inspection] files received:', (req.files || []).map(f => ({ fieldname: f.fieldname, originalname: f.originalname, size: f.buffer?.length })));
+
   const FIELDS = [
     'address', 'fname', 'lname', 'phone', 'customer_email', 'carrier', 'rep',
     'stormDate', 'hailSize', 'pitch', 'stories', 'squares', 'roofAge',
