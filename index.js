@@ -319,8 +319,8 @@ async function resolveCloserOption(repName) {
 async function createInspectionDeal(fields, contactId) {
   assertPipelineAllowed(INSPECTION_PIPELINE);
 
-  const { fname, lname, address, carrier, stormDate, squares, rep } = fields;
-  const dealname = `${[fname, lname].filter(Boolean).join(' ') || 'Unknown homeowner'} | ${address || 'No address'}`;
+  const { fname, lname, carrier, stormDate, squares, rep } = fields;
+  const dealname = [fname, lname].filter(Boolean).join(' ') || 'Unknown homeowner';
 
   const properties = {
     dealname,
