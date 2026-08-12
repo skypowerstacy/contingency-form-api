@@ -532,6 +532,17 @@ app.post('/inspection', upload.any(), async (req, res) => {
   }
 });
 
+/*
+ * Registered last, so it catches what the route handlers cannot: multer rejects
+ * a file (bad type, over the size limit) in middleware, before any route runs,
+ * so those errors would otherwise reach Express's default handler and come back
+ * as an HTML page. The browser parses every response as JSON.
+ */
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err.message || err);
+  res.status(err.status || 500).json({ success: false, error: err.message || 'Internal server error' });
+});
+
 app.listen(PORT, () => {
   console.log(`Contingency form API running on port ${PORT} ✓`);
 });
