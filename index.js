@@ -3,6 +3,7 @@ const multer = require('multer');
 const { Resend } = require('resend');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const ws = require('ws');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -319,7 +320,7 @@ async function createInspectionDeal(fields, contactId) {
   assertPipelineAllowed(INSPECTION_PIPELINE);
 
   const { fname, lname, address, carrier, stormDate, squares, rep } = fields;
-  const dealname = `${[fname, lname].filter(Boolean).join(' ') || 'Unknown homeowner'} - ${address || 'No address'}`;
+  const dealname = `${[fname, lname].filter(Boolean).join(' ') || 'Unknown homeowner'} | ${address || 'No address'}`;
 
   const properties = {
     dealname,
@@ -361,7 +362,18 @@ async function uploadPhotos(dealId, photos) {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set.');
 
-  const supabase = createClient(url, key);
+  /*
+   * supabase-js constructs a RealtimeClient even when only storage is used, and
+   * on Node < 22 there is no global WebSocket — createClient throws outright.
+   * Supplying `ws` keeps it working regardless of the Node the platform picks.
+   * Left inside this function on purpose: at module scope it would throw at
+   * boot whenever the Supabase env vars are unset, taking the whole service
+   * down instead of degrading to "photos were not uploaded".
+   */
+  const supabase = createClient(url, key, {
+    global: { fetch: fetch },
+    realtime: { transport: ws },
+  });
   const uploaded = [];
   const failed = [];
 
