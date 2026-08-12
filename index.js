@@ -316,13 +316,11 @@ async function updateContingencyDeal(deal, fields, zipUrl) {
   if (fields.adjusterPhone) properties.adjuster_phone = fields.adjusterPhone;
   if (fields.adjusterEmail) properties.adjuster_email = fields.adjusterEmail;
   /*
-   * datetime-local sends "2026-08-20T14:30". A HubSpot date property takes a
-   * date only, so the time portion is dropped here — the full wall-clock value
-   * still reaches ops in the notification email.
+   * The form's date input already sends YYYY-MM-DD, which is the shape a
+   * HubSpot date property wants — no conversion. The companion time field has
+   * nowhere to go on a date property, so it reaches ops via the email only.
    */
-  const meetingDate = fields.adjusterAppointment
-    ? String(fields.adjusterAppointment).split('T')[0]
-    : null;
+  const meetingDate = (fields.adjusterAppointmentDate || '').toString().trim();
   if (meetingDate) properties.adjuster_meeting_date = meetingDate;
   if (zipUrl) properties.contingency_form_url = zipUrl;
 
@@ -345,7 +343,8 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       adjusterName,
       adjusterPhone,
       adjusterEmail,
-      adjusterAppointment,
+      adjusterAppointmentDate,
+      adjusterAppointmentTime,
       submittedAt,
     } = req.body;
     const files = req.files;
@@ -441,19 +440,31 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
      * to be rendered verbatim, not converted. submittedDate above is different
      * — it is a real instant, so it genuinely converts to Denver.
      */
-    const appointment = (adjusterAppointment || '').trim();
-    // datetime-local omits seconds unless they are non-zero.
-    const appointmentUtc = appointment.length === 16 ? `${appointment}:00Z` : `${appointment}Z`;
-    const parsedAppointment = appointment ? new Date(appointmentUtc) : null;
-    const adjusterAppointmentDisplay = !appointment
+    const appointmentDate = (adjusterAppointmentDate || '').trim();
+    const appointmentTime = (adjusterAppointmentTime || '').trim();
+
+    // Pinned to UTC and formatted in UTC so the date prints exactly as typed.
+    const parsedDate = appointmentDate ? new Date(`${appointmentDate}T12:00:00Z`) : null;
+    const adjusterAppointmentDateDisplay = !appointmentDate
       ? 'Not scheduled'
-      : parsedAppointment && !isNaN(parsedAppointment.getTime())
-        ? parsedAppointment.toLocaleString('en-US', {
+      : parsedDate && !isNaN(parsedDate.getTime())
+        ? parsedDate.toLocaleDateString('en-US', {
             timeZone: 'UTC',
             dateStyle: 'full',
-            timeStyle: 'short',
           })
-        : appointment;
+        : appointmentDate;
+
+    // "14:30" -> "2:30 PM". Same wall-clock reasoning: never converted.
+    const parsedTime = appointmentTime ? new Date(`1970-01-01T${appointmentTime}Z`) : null;
+    const adjusterAppointmentTimeDisplay = !appointmentTime
+      ? 'Not provided'
+      : parsedTime && !isNaN(parsedTime.getTime())
+        ? parsedTime.toLocaleTimeString('en-US', {
+            timeZone: 'UTC',
+            hour: 'numeric',
+            minute: '2-digit',
+          })
+        : appointmentTime;
 
     const emailHtml = `
       <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
@@ -468,7 +479,8 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
           <p style="margin: 0 0 12px;"><strong>Adjuster Name:</strong> ${escapeHtml(optional(adjusterName))}</p>
           <p style="margin: 0 0 12px;"><strong>Adjuster Phone:</strong> ${escapeHtml(optional(adjusterPhone))}</p>
           <p style="margin: 0 0 12px;"><strong>Adjuster Email:</strong> ${escapeHtml(optional(adjusterEmail))}</p>
-          <p style="margin: 0 0 12px;"><strong>Adjuster Appointment:</strong> ${escapeHtml(adjusterAppointmentDisplay)}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Appointment Date:</strong> ${escapeHtml(adjusterAppointmentDateDisplay)}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Appointment Time:</strong> ${escapeHtml(adjusterAppointmentTimeDisplay)}</p>
           <p style="margin: 0 0 12px;"><strong>Rep:</strong> ${escapeHtml(repName.trim())}</p>
           <p style="margin: 0 0 12px;"><strong>Submitted:</strong> ${escapeHtml(submittedDate)}</p>
           <p style="margin: 0 0 12px;"><strong>Pages attached:</strong> ${files.length}</p>
