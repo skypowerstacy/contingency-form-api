@@ -255,7 +255,15 @@ async function updateContingencyDeal(deal, fields, zipUrl) {
   if (fields.adjusterName) properties.adjuster_name = fields.adjusterName;
   if (fields.adjusterPhone) properties.adjuster_phone = fields.adjusterPhone;
   if (fields.adjusterEmail) properties.adjuster_email = fields.adjusterEmail;
-  if (fields.adjusterAppointment) properties.adjuster_meeting_date = fields.adjusterAppointment;
+  /*
+   * datetime-local sends "2026-08-20T14:30". A HubSpot date property takes a
+   * date only, so the time portion is dropped here — the full wall-clock value
+   * still reaches ops in the notification email.
+   */
+  const meetingDate = fields.adjusterAppointment
+    ? String(fields.adjusterAppointment).split('T')[0]
+    : null;
+  if (meetingDate) properties.adjuster_meeting_date = meetingDate;
   if (zipUrl) properties.contingency_form_url = zipUrl;
 
   await hubspot(`/crm/v3/objects/deals/${deal.dealId}`, {
