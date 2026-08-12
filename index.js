@@ -910,7 +910,7 @@ async function updateScopeDeal(deal, zipUrl) {
   console.log('[scope] deal', deal.dealId, 'moved to Scope Received/Review with', Object.keys(properties).join(', '));
 }
 
-function scopeEmailHtml(propertyAddress, scopeUrl, submittedDate, fileCount, warnings) {
+function scopeEmailHtml(homeownerName, propertyAddress, scopeUrl, submittedDate, fileCount, warnings) {
   const linkBlock = scopeUrl
     ? `<p style="margin:0 0 12px"><a href="${escapeHtml(scopeUrl)}" style="color:#C9922A">Download scope of loss (${fileCount} file${fileCount === 1 ? '' : 's'}) →</a></p>`
     : `<p style="margin:0 0 12px;color:#6b7280">${fileCount} file${fileCount === 1 ? '' : 's'} received — storage link unavailable.</p>`;
@@ -925,6 +925,7 @@ function scopeEmailHtml(propertyAddress, scopeUrl, submittedDate, fileCount, war
         <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — Scope of Loss Received</h1>
       </div>
       <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
+        <p style="margin:0 0 12px"><strong>Homeowner:</strong> ${escapeHtml(homeownerName)}</p>
         <p style="margin:0 0 12px"><strong>Property address:</strong> ${escapeHtml(propertyAddress)}</p>
         ${linkBlock}
         <p style="margin:0;color:#6b7280;font-size:13px"><strong>Submitted:</strong> ${escapeHtml(submittedDate)}</p>
@@ -941,6 +942,9 @@ app.post('/scope', upload.any(), async (req, res) => {
 
   try {
     const propertyAddress = (req.body?.propertyAddress ?? '').toString().trim();
+    // Display-only: the deal is matched on address, so a missing or misspelled
+    // name never affects the lookup.
+    const homeownerName = (req.body?.homeownerName ?? '').toString().trim() || 'Unknown Homeowner';
     const files = req.files || [];
 
     if (!propertyAddress) {
@@ -994,8 +998,8 @@ app.post('/scope', upload.any(), async (req, res) => {
       await resend.emails.send({
         from: 'NuHome Forms <noreply@thehiveoffice.com>',
         to: ['stacy@thenuhome.com'],
-        subject: `Scope of Loss Received — ${propertyAddress}`,
-        html: scopeEmailHtml(propertyAddress, scopeUrl, submittedDate, files.length, warnings),
+        subject: `Scope of Loss Received — ${homeownerName} | ${propertyAddress}`,
+        html: scopeEmailHtml(homeownerName, propertyAddress, scopeUrl, submittedDate, files.length, warnings),
       });
     } catch (err) {
       console.error('[scope] ops email failed:', err);
