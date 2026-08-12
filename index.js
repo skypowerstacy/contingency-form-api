@@ -20,8 +20,11 @@ const PHOTO_BUCKET = 'inspections';
 const PHOTO_ZIP_NAME = 'inspection-photos.zip';
 const CONTINGENCY_BUCKET = 'contingency';
 const CONTINGENCY_ZIP_NAME = 'contingency-form.zip';
-// Roofing - Insurance, the same pipeline INSPECTION_PIPELINE names.
+const SCOPE_BUCKET = 'scopes';
+const SCOPE_ZIP_NAME = 'scope.zip';
+// Both stages live in Roofing - Insurance, the pipeline INSPECTION_PIPELINE names.
 const CONTINGENCY_SIGNED_STAGE = '4109489900';
+const SCOPE_REVIEW_STAGE = '4109489903';
 
 /*
  * Ops/Install. Sales deals live here and the Deals Dashboard reads from it —
@@ -151,22 +154,23 @@ function addressesMatch(a, b) {
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 /**
- * Uploads each page individually, then a zip of all of them.
+ * Uploads each file individually, then a zip of all of them, into
+ * {bucket}/{slug}/. Returns the public URL of the zip.
  *
- * Folder is the property address: the deal id is not known until the lookup
- * below, which itself needs the zip URL, so the address is what we have.
+ * The folder is the property address rather than the deal id: the deal lookup
+ * needs the zip URL to write onto the deal, so the id is not known yet.
  */
-async function uploadContingencyFiles(slug, files) {
+async function uploadFilesAndZip({ bucket, slug, files, zipName, label, defaultExt = 'pdf' }) {
   const supabase = createSupabaseClient();
   const uploaded = [];
   const failed = [];
 
-  console.log('[submit] uploading', files.length, 'file(s) to', `${CONTINGENCY_BUCKET}/${slug}/`);
+  console.log(`${label} uploading`, files.length, 'file(s) to', `${bucket}/${slug}/`);
 
   for (const file of files) {
-    const safeName = String(file.originalname || 'page.pdf').replace(/[^\w.\-]/g, '_');
+    const safeName = String(file.originalname || `page.${defaultExt}`).replace(/[^\w.\-]/g, '_');
     const path = `${slug}/${safeName}`;
-    const { error } = await supabase.storage.from(CONTINGENCY_BUCKET).upload(path, file.buffer, {
+    const { error } = await supabase.storage.from(bucket).upload(path, file.buffer, {
       contentType: file.mimetype,
       upsert: true,
     });
@@ -174,25 +178,25 @@ async function uploadContingencyFiles(slug, files) {
     else uploaded.push(path);
   }
 
-  // A zip failure must not discard the pages that already uploaded.
+  // A zip failure must not discard the files that already uploaded.
   let zipUrl = null;
   try {
     const zipBuffer = await zipEntries(files.map((file, i) => ({
-      name: file.originalname || `contingency-page-${i + 1}.pdf`,
+      name: file.originalname || `page-${i + 1}.${defaultExt}`,
       buffer: file.buffer,
     })));
-    const zipPath = `${slug}/${CONTINGENCY_ZIP_NAME}`;
-    const { error } = await supabase.storage.from(CONTINGENCY_BUCKET).upload(zipPath, zipBuffer, {
+    const zipPath = `${slug}/${zipName}`;
+    const { error } = await supabase.storage.from(bucket).upload(zipPath, zipBuffer, {
       contentType: 'application/zip',
       upsert: true,
     });
     if (error) failed.push(`${zipPath}: ${error.message}`);
-    else zipUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${CONTINGENCY_BUCKET}/${zipPath}`;
+    else zipUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${bucket}/${zipPath}`;
   } catch (err) {
-    failed.push(`${slug}/${CONTINGENCY_ZIP_NAME}: ${err.message}`);
+    failed.push(`${slug}/${zipName}: ${err.message}`);
   }
 
-  console.log('[submit] storage done. uploaded:', uploaded.length, 'failed:', failed.length, 'zipUrl:', zipUrl);
+  console.log(`${label} storage done. uploaded:`, uploaded.length, 'failed:', failed.length, 'zipUrl:', zipUrl);
   return { uploaded, failed, zipUrl };
 }
 
@@ -223,7 +227,7 @@ async function findDealByAddress(rawAddress) {
   const candidates = (search?.results || [])
     .filter(c => addressesMatch(target, normaliseAddress(c.properties?.address)));
 
-  console.log('[submit] address lookup:', JSON.stringify(target), '- token:', token,
+  console.log('[deal-lookup] address:', JSON.stringify(target), '- token:', token,
     '- contacts searched:', (search?.results || []).length, '- address matches:', candidates.length);
 
   for (const contact of candidates) {
@@ -308,7 +312,13 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
 
     let zipUrl = null;
     try {
-      const result = await uploadContingencyFiles(slug, files);
+      const result = await uploadFilesAndZip({
+        bucket: CONTINGENCY_BUCKET,
+        slug,
+        files,
+        zipName: CONTINGENCY_ZIP_NAME,
+        label: '[submit]',
+      });
       zipUrl = result.zipUrl;
       if (result.failed.length) {
         console.error('[submit] storage failures:', result.failed);
@@ -803,6 +813,132 @@ app.post('/inspection', upload.any(), async (req, res) => {
       error: err.message || 'Inspection submission failed.',
       dealId,
       photosUrl,
+    });
+  }
+});
+
+// ===========================================================================
+// /scope — scope of loss intake from the Stage 8 button on the roofing guide
+// ===========================================================================
+
+async function updateScopeDeal(deal, zipUrl) {
+  // Asserted against the pipeline HubSpot reports for this deal, not our own
+  // constant, so a deal in the forbidden pipeline can never be patched.
+  assertPipelineAllowed(deal.pipeline);
+
+  const properties = { dealstage: SCOPE_REVIEW_STAGE };
+  if (zipUrl) properties.scope_document_url = zipUrl;
+
+  await hubspot(`/crm/v3/objects/deals/${deal.dealId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties }),
+  });
+
+  console.log('[scope] deal', deal.dealId, 'moved to Scope Received/Review with', Object.keys(properties).join(', '));
+}
+
+function scopeEmailHtml(propertyAddress, scopeUrl, submittedDate, fileCount, warnings) {
+  const linkBlock = scopeUrl
+    ? `<p style="margin:0 0 12px"><a href="${escapeHtml(scopeUrl)}" style="color:#C9922A">Download scope of loss (${fileCount} file${fileCount === 1 ? '' : 's'}) →</a></p>`
+    : `<p style="margin:0 0 12px;color:#6b7280">${fileCount} file${fileCount === 1 ? '' : 's'} received — storage link unavailable.</p>`;
+
+  const warnBlock = warnings.length
+    ? `<p style="margin:16px 0 0;color:#b45309;font-size:12px">Partial submission — ${escapeHtml(warnings.join(' · '))}</p>`
+    : '';
+
+  return `
+    <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+      <div style="background:#1B2A4A;padding:24px;border-radius:8px 8px 0 0">
+        <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — Scope of Loss Received</h1>
+      </div>
+      <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
+        <p style="margin:0 0 12px"><strong>Property address:</strong> ${escapeHtml(propertyAddress)}</p>
+        ${linkBlock}
+        <p style="margin:0;color:#6b7280;font-size:13px"><strong>Submitted:</strong> ${escapeHtml(submittedDate)}</p>
+        ${warnBlock}
+      </div>
+    </div>
+  `;
+}
+
+app.post('/scope', upload.any(), async (req, res) => {
+  const warnings = [];
+  let scopeUrl = null;
+  let dealId = null;
+
+  try {
+    const propertyAddress = (req.body?.propertyAddress ?? '').toString().trim();
+    const files = req.files || [];
+
+    if (!propertyAddress) {
+      return res.status(400).json({ success: false, error: 'Property address is required.' });
+    }
+    if (!files.length) {
+      return res.status(400).json({ success: false, error: 'At least one file is required.' });
+    }
+
+    const slug = addressSlug(propertyAddress);
+
+    // ---- Supabase ----
+    try {
+      const result = await uploadFilesAndZip({
+        bucket: SCOPE_BUCKET,
+        slug,
+        files,
+        zipName: SCOPE_ZIP_NAME,
+        label: '[scope]',
+      });
+      scopeUrl = result.zipUrl;
+      if (result.failed.length) {
+        console.error('[scope] storage failures:', result.failed);
+        warnings.push(`${result.failed.length} file(s) failed to upload to storage`);
+      }
+    } catch (err) {
+      console.error('[scope] Supabase upload failed:', err);
+      warnings.push('Files were not uploaded to storage');
+    }
+
+    // ---- HubSpot ----
+    try {
+      const deal = await findDealByAddress(propertyAddress);
+      if (deal) {
+        await updateScopeDeal(deal, scopeUrl);
+        dealId = deal.dealId;
+      } else {
+        console.warn('[scope] no Roofing - Insurance deal found for address:', propertyAddress);
+        warnings.push('No matching HubSpot deal found — nothing was updated');
+      }
+    } catch (err) {
+      console.error('[scope] HubSpot deal update failed:', err);
+      warnings.push('HubSpot deal was not updated');
+    }
+
+    // ---- Ops email (always attempted, with whatever survived above) ----
+    const submittedDate = new Date().toLocaleString('en-US', {
+      timeZone: 'America/Denver', dateStyle: 'full', timeStyle: 'short',
+    });
+    try {
+      await resend.emails.send({
+        from: 'NuHome Forms <noreply@thehiveoffice.com>',
+        to: ['stacy@thenuhome.com'],
+        subject: `Scope of Loss Received — ${propertyAddress}`,
+        html: scopeEmailHtml(propertyAddress, scopeUrl, submittedDate, files.length, warnings),
+      });
+    } catch (err) {
+      console.error('[scope] ops email failed:', err);
+      warnings.push('Ops email was not sent');
+    }
+
+    return res.json({ success: true, scopeUrl, dealId, warnings });
+
+  } catch (err) {
+    console.error('[scope] unhandled error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Scope submission failed.',
+      scopeUrl,
+      dealId,
+      warnings,
     });
   }
 });
