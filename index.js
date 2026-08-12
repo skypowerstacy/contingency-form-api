@@ -110,9 +110,69 @@ function escapeHtml(value) {
 
 // ---- Address handling (shared by /submit's storage path and deal lookup) ----
 
-const STREET_ABBREVIATIONS = {
-  st: 'street', ave: 'avenue', blvd: 'boulevard', dr: 'drive',
-  ln: 'lane', ct: 'court', rd: 'road',
+/*
+ * Full USPS street-suffix set plus directionals. Applied token by token to the
+ * lowercased, punctuation-stripped address, so "123 N Main St" and
+ * "123 north main street" collapse to the same string.
+ *
+ * Identity entries (park, loop, way…) are kept deliberately: the map doubles as
+ * the canonical list, and a no-op lookup costs nothing.
+ */
+const ABBREVS = {
+  'n': 'north', 'ne': 'northeast', 'nw': 'northwest',
+  's': 'south', 'se': 'southeast', 'sw': 'southwest',
+  'e': 'east', 'w': 'west',
+  'aly': 'alley', 'anx': 'annex', 'arc': 'arcade', 'ave': 'avenue',
+  'byu': 'bayou', 'bch': 'beach', 'bnd': 'bend', 'blf': 'bluff',
+  'blfs': 'bluffs', 'btm': 'bottom', 'blvd': 'boulevard', 'br': 'branch',
+  'brg': 'bridge', 'brk': 'brook', 'brks': 'brooks', 'bg': 'burg',
+  'bgs': 'burgs', 'byp': 'bypass', 'cp': 'camp', 'cyn': 'canyon',
+  'cpe': 'cape', 'cswy': 'causeway', 'ctr': 'center', 'ctrs': 'centers',
+  'cir': 'circle', 'cirs': 'circles', 'clf': 'cliff', 'clfs': 'cliffs',
+  'clb': 'club', 'cmn': 'common', 'cmns': 'commons', 'cor': 'corner',
+  'cors': 'corners', 'crse': 'course', 'ct': 'court', 'cts': 'courts',
+  'cv': 'cove', 'cvs': 'coves', 'crk': 'creek', 'cres': 'crescent',
+  'crst': 'crest', 'xing': 'crossing', 'xrd': 'crossroad',
+  'xrds': 'crossroads', 'curv': 'curve', 'dl': 'dale', 'dm': 'dam',
+  'dv': 'divide', 'dr': 'drive', 'drs': 'drives', 'est': 'estate',
+  'ests': 'estates', 'expy': 'expressway', 'ext': 'extension',
+  'exts': 'extensions', 'fall': 'fall', 'fls': 'falls', 'fry': 'ferry',
+  'fld': 'field', 'flds': 'fields', 'flt': 'flat', 'flts': 'flats',
+  'frd': 'ford', 'frds': 'fords', 'frst': 'forest', 'frg': 'forge',
+  'frgs': 'forges', 'frk': 'fork', 'frks': 'forks', 'ft': 'fort',
+  'fwy': 'freeway', 'gdn': 'garden', 'gdns': 'gardens', 'gtwy': 'gateway',
+  'gln': 'glen', 'glns': 'glens', 'grn': 'green', 'grns': 'greens',
+  'grv': 'grove', 'grvs': 'groves', 'hbr': 'harbor', 'hbrs': 'harbors',
+  'hvn': 'haven', 'hts': 'heights', 'hwy': 'highway', 'hl': 'hill',
+  'hls': 'hills', 'holw': 'hollow', 'inlt': 'inlet', 'is': 'island',
+  'iss': 'islands', 'isle': 'isle', 'jct': 'junction', 'jcts': 'junctions',
+  'ky': 'key', 'kys': 'keys', 'knl': 'knoll', 'knls': 'knolls',
+  'lk': 'lake', 'lks': 'lakes', 'land': 'land', 'lndg': 'landing',
+  'ln': 'lane', 'lgt': 'light', 'lgts': 'lights', 'lf': 'loaf',
+  'lck': 'lock', 'lcks': 'locks', 'ldg': 'lodge', 'loop': 'loop',
+  'mall': 'mall', 'mnr': 'manor', 'mnrs': 'manors', 'mdw': 'meadow',
+  'mdws': 'meadows', 'mews': 'mews', 'ml': 'mill', 'mls': 'mills',
+  'msn': 'mission', 'mtwy': 'motorway', 'mt': 'mount', 'mtn': 'mountain',
+  'mtns': 'mountains', 'nck': 'neck', 'orch': 'orchard', 'oval': 'oval',
+  'opas': 'overpass', 'park': 'park', 'pkwy': 'parkway', 'pass': 'pass',
+  'psge': 'passage', 'path': 'path', 'pike': 'pike', 'pne': 'pine',
+  'pnes': 'pines', 'pl': 'place', 'pln': 'plain', 'plns': 'plains',
+  'plz': 'plaza', 'pt': 'point', 'pts': 'points', 'prt': 'port',
+  'prts': 'ports', 'pr': 'prairie', 'radl': 'radial', 'ramp': 'ramp',
+  'rnch': 'ranch', 'rpds': 'rapids', 'rst': 'rest', 'rdg': 'ridge',
+  'rdgs': 'ridges', 'riv': 'river', 'rd': 'road', 'rds': 'roads',
+  'rte': 'route', 'row': 'row', 'rue': 'rue', 'run': 'run',
+  'shl': 'shoal', 'shls': 'shoals', 'shr': 'shore', 'shrs': 'shores',
+  'skwy': 'skyway', 'spg': 'spring', 'spgs': 'springs', 'spur': 'spur',
+  'sq': 'square', 'sqs': 'squares', 'sta': 'station', 'stra': 'stravenue',
+  'strm': 'stream', 'st': 'street', 'sts': 'streets', 'smt': 'summit',
+  'ter': 'terrace', 'trwy': 'throughway', 'trce': 'trace', 'trak': 'track',
+  'trfy': 'trafficway', 'trl': 'trail', 'tunl': 'tunnel', 'tpke': 'turnpike',
+  'upas': 'underpass', 'un': 'union', 'uns': 'unions', 'vly': 'valley',
+  'vlys': 'valleys', 'via': 'viaduct', 'vw': 'view', 'vws': 'views',
+  'vill': 'village', 'vlg': 'village', 'vlgs': 'villages', 'vis': 'vista',
+  'walk': 'walk', 'wall': 'wall', 'way': 'way', 'ways': 'ways',
+  'wl': 'well', 'wls': 'wells',
 };
 
 /**
@@ -126,7 +186,7 @@ function normaliseAddress(value) {
     .replace(/[^\w\s]/g, ' ')
     .split(/\s+/)
     .filter(Boolean)
-    .map(word => STREET_ABBREVIATIONS[word] || word)
+    .map(word => ABBREVS[word] || word)
     .join(' ');
 }
 
