@@ -327,10 +327,9 @@ async function createInspectionDeal(fields, contactId) {
     dealstage: INSPECTION_STAGE,
   };
   if (carrier) properties.insurance_company = carrier;
-  if (stormDate) {
-    properties.storm_date = stormDate;
-    properties.date_of_loss = stormDate; // no separate field is collected today
-  }
+  // The form collects one storm date; HubSpot has no storm_date property, so it
+  // lands on date_of_loss alone.
+  if (stormDate) properties.date_of_loss = stormDate;
   if (squares) properties.number_of_squares = squares;
 
   let closerWarning = null;
