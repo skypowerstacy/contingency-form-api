@@ -63,8 +63,9 @@ const upload = multer({
      */
     const allowedExtension = /\.(jpe?g|png|heic|pdf)$/i;
 
-    // Strip any parameters ("image/jpeg; charset=…") and normalise case.
-    const mimetype = String(file.mimetype || '').toLowerCase().split(';')[0].trim();
+    // Strip any parameters, e.g. "image/jpeg; charset=utf-8".
+    console.log('fileFilter received:', file.fieldname, file.mimetype, file.originalname);
+    const mimetype = (file.mimetype || '').split(';')[0].trim();
 
     if (allowed.includes(mimetype) || allowedExtension.test(file.originalname || '')) {
       cb(null, true);
