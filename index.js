@@ -1009,7 +1009,7 @@ app.post('/scope', upload.any(), async (req, res) => {
     try {
       await resend.emails.send({
         from: 'NuHome Forms <noreply@thehiveoffice.com>',
-        to: ['stacy@thenuhome.com'],
+        to: ['stacy@thenuhome.com', 'taylor@thenuhome.com'],
         subject: `Scope of Loss Received — ${homeownerName} | ${propertyAddress}`,
         html: scopeEmailHtml(homeownerName, propertyAddress, scopeUrl, submittedDate, files.length, warnings),
       });
