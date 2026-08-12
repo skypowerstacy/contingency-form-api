@@ -354,14 +354,16 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       return res.status(400).json({ error: 'At least one file is required.' });
     }
 
+    /*
+     * Matches what the frontend actually enforces. Carrier, claim number and
+     * adjuster details are frequently unknown when the contingency is signed —
+     * they arrive later — so they flow through to HubSpot and the email when
+     * present and are simply omitted when not.
+     */
     const required = [
       [repName, 'Rep name'],
       [customerName, 'Customer name'],
       [propertyAddress, 'Property address'],
-      [insuranceCarrier, 'Insurance carrier'],
-      [claimNumber, 'Claim number'],
-      [adjusterName, 'Adjuster name'],
-      [adjusterPhone, 'Adjuster phone'],
     ];
 
     for (const [value, label] of required) {
@@ -423,7 +425,9 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       ? new Date(submittedAt).toLocaleString('en-US', { timeZone: 'America/Denver', dateStyle: 'full', timeStyle: 'short' })
       : new Date().toLocaleString('en-US', { timeZone: 'America/Denver', dateStyle: 'full', timeStyle: 'short' });
 
-    const adjusterEmailDisplay = (adjusterEmail || '').trim() || 'Not provided';
+    // These are optional now, so they may be empty or absent entirely — a bare
+    // .trim() on an absent field would throw before the email is ever sent.
+    const optional = value => (value || '').trim() || 'Not provided';
 
     /*
      * The datetime-local input sends a wall-clock value with no offset, e.g.
@@ -459,11 +463,11 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
         <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px;">
           <p style="margin: 0 0 12px;"><strong>Customer:</strong> ${escapeHtml(customerName.trim())}</p>
           <p style="margin: 0 0 12px;"><strong>Property Address:</strong> ${escapeHtml(propertyAddress.trim())}</p>
-          <p style="margin: 0 0 12px;"><strong>Insurance Carrier:</strong> ${escapeHtml(insuranceCarrier.trim())}</p>
-          <p style="margin: 0 0 12px;"><strong>Claim Number:</strong> ${escapeHtml(claimNumber.trim())}</p>
-          <p style="margin: 0 0 12px;"><strong>Adjuster Name:</strong> ${escapeHtml(adjusterName.trim())}</p>
-          <p style="margin: 0 0 12px;"><strong>Adjuster Phone:</strong> ${escapeHtml(adjusterPhone.trim())}</p>
-          <p style="margin: 0 0 12px;"><strong>Adjuster Email:</strong> ${escapeHtml(adjusterEmailDisplay)}</p>
+          <p style="margin: 0 0 12px;"><strong>Insurance Carrier:</strong> ${escapeHtml(optional(insuranceCarrier))}</p>
+          <p style="margin: 0 0 12px;"><strong>Claim Number:</strong> ${escapeHtml(optional(claimNumber))}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Name:</strong> ${escapeHtml(optional(adjusterName))}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Phone:</strong> ${escapeHtml(optional(adjusterPhone))}</p>
+          <p style="margin: 0 0 12px;"><strong>Adjuster Email:</strong> ${escapeHtml(optional(adjusterEmail))}</p>
           <p style="margin: 0 0 12px;"><strong>Adjuster Appointment:</strong> ${escapeHtml(adjusterAppointmentDisplay)}</p>
           <p style="margin: 0 0 12px;"><strong>Rep:</strong> ${escapeHtml(repName.trim())}</p>
           <p style="margin: 0 0 12px;"><strong>Submitted:</strong> ${escapeHtml(submittedDate)}</p>
