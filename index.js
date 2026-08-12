@@ -540,7 +540,8 @@ app.post('/inspection', upload.any(), async (req, res) => {
  */
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err.message || err);
-  res.status(err.status || 500).json({ success: false, error: err.message || 'Internal server error' });
+  const status = err instanceof multer.MulterError ? 400 : (err.status || 500);
+  res.status(status).json({ success: false, error: err.message || 'Internal server error' });
 });
 
 app.listen(PORT, () => {
