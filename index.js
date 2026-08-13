@@ -57,14 +57,27 @@ function assertPipelineAllowed(pipelineId) {
 
 /*
  * Total-upload cap, checked per route after parsing — multer has no option for
- * a combined limit. The per-file cap is applied in the handlers too (see the
- * oversized filter): a single huge photo skips itself rather than failing the
- * whole submission, which would cost the rep every other file they took.
+ * a combined limit.
  */
 const MAX_TOTAL_UPLOAD_BYTES = 200 * 1024 * 1024;
 
+/*
+ * Per-file size is enforced in two tiers, because storage is in-memory and a
+ * file is fully buffered before any handler code runs:
+ *
+ *   100MB (here)  multer aborts the stream mid-upload, so a pathological file
+ *                 never fills RAM. Nothing recoverable happens at this size.
+ *   25MB (handlers)  the graceful tier — the file arrives, is discarded, and
+ *                 the rest of the submission proceeds with a warning.
+ *
+ * Files between the two skip themselves; files above the backstop fail the
+ * request via the MulterError path, which is the trade for not OOMing.
+ */
+const MULTER_ABORT_BYTES = 100 * 1024 * 1024;
+
 const upload = multer({
   storage: multer.memoryStorage(),
+  limits: { fileSize: MULTER_ABORT_BYTES },
   fileFilter: (req, file, cb) => {
     const allowed = [
       'image/jpeg',
@@ -447,6 +460,15 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
       submittedAt,
     } = req.body;
     const files = req.files;
+
+    // Distinguishes "you attached nothing" from "everything you attached was
+    // dropped by the 25MB filter" — otherwise the rep is told to attach a file
+    // they can see they already attached.
+    if (oversized.length && (!files || files.length === 0)) {
+      return res.status(400).json({
+        error: 'All attached files exceeded the 25MB size limit. Please compress and resubmit.',
+      });
+    }
 
     if (!files || files.length === 0) {
       return res.status(400).json({ error: 'At least one file is required.' });
@@ -1223,6 +1245,12 @@ app.post('/scope', upload.any(), async (req, res) => {
 
     if (!propertyAddress) {
       return res.status(400).json({ success: false, error: 'Property address is required.' });
+    }
+    if (oversized.length && files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'All attached files exceeded the 25MB size limit. Please compress and resubmit.',
+      });
     }
     if (!files.length) {
       return res.status(400).json({ success: false, error: 'At least one file is required.' });
