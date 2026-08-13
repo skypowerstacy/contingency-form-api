@@ -811,6 +811,52 @@ async function uploadPhotos(dealId, photos) {
   return { uploaded, failed, photosUrl };
 }
 
+// ---- Inspection report records ---------------------------------------------
+const REPORTS_TABLE = 'nuhome_inspection_reports';
+
+/*
+ * PostgREST rather than supabase-js: the client here is constructed for storage
+ * only, and the service role key bypasses RLS, so a plain fetch is the whole
+ * dependency. Trailing slashes on SUPABASE_URL would produce a double slash.
+ */
+function supabaseRest(path) {
+  const url = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set.');
+  return {
+    endpoint: `${url}/rest/v1/${path}`,
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+  };
+}
+
+/** Inserts the report row and returns its generated uuid. */
+async function saveInspectionReport({ dealId, fields, damageReport, reportJson, photosUrl }) {
+  const { endpoint, headers } = supabaseRest(REPORTS_TABLE);
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    // Without return=representation PostgREST answers 201 with an empty body,
+    // and the generated id — the whole point of the insert — is lost.
+    headers: { ...headers, Prefer: 'return=representation' },
+    body: JSON.stringify({
+      deal_id: dealId,
+      report_data: { fields, damageReport, reportJson },
+      photos_url: photosUrl,
+    }),
+  });
+
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(body?.message || `Supabase returned HTTP ${res.status}`);
+
+  const row = Array.isArray(body) ? body[0] : body;
+  if (!row?.id) throw new Error('Supabase insert returned no id.');
+  return row.id;
+}
+
 function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes) {
   const rows = [
     ['Property address', fields.address],
@@ -866,6 +912,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
   const notes = [];
   let dealId = null;
   let photosUrl = null;
+  let reportId = null;
 
   console.log('[inspection] raw body keys:', Object.keys(req.body || {}));
   console.log('[inspection] raw body values:', JSON.stringify(req.body || {}));
@@ -881,6 +928,23 @@ app.post('/inspection', upload.any(), async (req, res) => {
     const fields = {};
     for (const key of FIELDS) fields[key] = (req.body?.[key] ?? '').toString().trim();
     const damageReport = (req.body?.damageReport ?? '').toString();
+
+    /*
+     * The structured AI report, sent alongside the flattened damageReport text.
+     * The shareable report page renders from this — badge, findings and their
+     * severities survive here but not in the flattened text. Older clients that
+     * predate this field simply store null.
+     */
+    let reportJson = null;
+    const rawReportJson = (req.body?.reportJson ?? '').toString().trim();
+    if (rawReportJson) {
+      try {
+        reportJson = JSON.parse(rawReportJson);
+      } catch (err) {
+        console.error('[inspection] reportJson was not valid JSON:', err.message);
+        notes.push('Structured report JSON was malformed and not stored');
+      }
+    }
 
     // Accepts photos_<category> with or without the [] suffix the browser sends.
     const photos = (req.files || [])
@@ -939,6 +1003,19 @@ app.post('/inspection', upload.any(), async (req, res) => {
       notes.push('Photos were not uploaded — no deal id to file them under');
     }
 
+    /*
+     * Saved after the deal and photos so the row carries both. Best-effort like
+     * everything above it: a failure here costs the shareable link, not the
+     * submission, so it becomes a warning rather than an error.
+     */
+    try {
+      reportId = await saveInspectionReport({ dealId, fields, damageReport, reportJson, photosUrl });
+      console.log('[inspection] saved report', reportId, 'for deal', dealId);
+    } catch (err) {
+      console.error('[inspection] report save failed:', err);
+      notes.push('Report was not saved — shareable link unavailable');
+    }
+
     // ---- Ops email (always attempted, with whatever survived above) ----
     try {
       await resend.emails.send({
@@ -955,6 +1032,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
     return res.json({
       success: true,
       dealId,
+      reportId,
       photosUrl,
       damageReport,
       ...(notes.length ? { warnings: notes } : {}),
@@ -1196,6 +1274,44 @@ app.post('/report', async (req, res) => {
   } catch (err) {
     console.error('[report] generation failed:', err);
     return res.status(500).json({ error: 'Report generation failed' });
+  }
+});
+
+/*
+ * Public by design — the uuid is the capability. Anyone holding the link can
+ * read the report, so it carries the homeowner's contact details to whoever it
+ * is forwarded to; that is the same exposure as the link itself.
+ *
+ * Distinct from POST /report above (the AI generation proxy) — same path, and
+ * only the method and the :reportId segment separate them.
+ */
+app.get('/report/:reportId', async (req, res) => {
+  const { reportId } = req.params;
+
+  // PostgREST answers a malformed uuid with a 400 and a Postgres cast error;
+  // checking the shape here keeps that from surfacing as a 500.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reportId)) {
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
+  try {
+    const { endpoint, headers } = supabaseRest(
+      `${REPORTS_TABLE}?id=eq.${encodeURIComponent(reportId)}&select=report_data&limit=1`
+    );
+    const response = await fetch(endpoint, { headers });
+    const rows = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(rows?.message || `Supabase returned HTTP ${response.status}`);
+    }
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    return res.json(rows[0].report_data || {});
+  } catch (err) {
+    console.error('[report] fetch failed:', err);
+    return res.status(500).json({ error: 'Could not load report' });
   }
 });
 
