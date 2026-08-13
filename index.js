@@ -240,15 +240,7 @@ async function uploadFilesAndZip({ bucket, slug, files, zipName, label, defaultE
       upsert: true,
     });
     if (error) failed.push(`${path}: ${error.message}`);
-    /*
-     * safeName has already stripped everything outside [\w.-], and dealId and
-     * category are machine-generated, so the path needs no URL encoding.
-     */
-    else uploaded.push({
-      path,
-      category: photo.category,
-      url: `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${path}`,
-    });
+    else uploaded.push(path);
   }
 
   // A zip failure must not discard the files that already uploaded.
@@ -795,7 +787,15 @@ async function uploadPhotos(dealId, photos) {
     });
     console.log('Supabase upload result for', path, '- data:', data, '- error:', error);
     if (error) failed.push(`${path}: ${error.message}`);
-    else uploaded.push(path);
+    /*
+     * safeName has already stripped everything outside [\w.-], and dealId and
+     * category are machine-generated, so the path needs no URL encoding.
+     */
+    else uploaded.push({
+      path,
+      category: photo.category,
+      url: `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${path}`,
+    });
   }
 
   // Zip failures must not discard the individual uploads that already
