@@ -55,9 +55,21 @@ function assertPipelineAllowed(pipelineId) {
   }
 }
 
+/*
+ * Per-file cap, enforced by multer itself — it aborts the stream and the global
+ * handler turns the MulterError into a 400.
+ */
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+
+/*
+ * Total-upload cap. multer has no equivalent option, so each upload route
+ * checks it after parsing; see the totalBytes guard in the handlers.
+ */
+const MAX_TOTAL_UPLOAD_BYTES = 200 * 1024 * 1024;
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 },
+  limits: { fileSize: MAX_FILE_BYTES },
   fileFilter: (req, file, cb) => {
     const allowed = [
       'image/jpeg',
@@ -404,6 +416,14 @@ async function createContingencyDeal(fields, zipUrl) {
 }
 
 app.post('/submit', upload.array('files', 10), async (req, res) => {
+  const totalBytes = (req.files || []).reduce((sum, f) => sum + f.size, 0);
+  if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
+    return res.status(400).json({
+      success: false,
+      error: 'Total upload size exceeds 200MB. Please reduce the number or size of files.',
+    });
+  }
+
   try {
     const {
       repName,
@@ -922,6 +942,14 @@ function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes)
 }
 
 app.post('/inspection', upload.any(), async (req, res) => {
+  const totalBytes = (req.files || []).reduce((sum, f) => sum + f.size, 0);
+  if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
+    return res.status(400).json({
+      success: false,
+      error: 'Total upload size exceeds 200MB. Please reduce the number or size of files.',
+    });
+  }
+
   const notes = [];
   let dealId = null;
   let photosUrl = null;
@@ -1139,6 +1167,14 @@ function scopeEmailHtml(homeownerName, propertyAddress, scopeUrl, submittedDate,
 }
 
 app.post('/scope', upload.any(), async (req, res) => {
+  const totalBytes = (req.files || []).reduce((sum, f) => sum + f.size, 0);
+  if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
+    return res.status(400).json({
+      success: false,
+      error: 'Total upload size exceeds 200MB. Please reduce the number or size of files.',
+    });
+  }
+
   const warnings = [];
   let scopeUrl = null;
   let dealId = null;
