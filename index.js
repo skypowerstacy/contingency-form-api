@@ -18,6 +18,9 @@ const INSPECTION_STAGE = '4130205409'; // Site Inspection
 const SUPABASE_PROJECT_REF = 'rfytaiowxtpmesqzoidz';
 const PHOTO_BUCKET = 'inspections';
 const PHOTO_ZIP_NAME = 'inspection-photos.zip';
+// The frontend posts the generated PDF as photos_report[] — same bucket as the
+// photos, but never part of the gallery.
+const REPORT_PDF_CATEGORY = 'report';
 const CONTINGENCY_BUCKET = 'contingency';
 const CONTINGENCY_ZIP_NAME = 'contingency-form.zip';
 const SCOPE_BUCKET = 'scopes';
@@ -237,7 +240,15 @@ async function uploadFilesAndZip({ bucket, slug, files, zipName, label, defaultE
       upsert: true,
     });
     if (error) failed.push(`${path}: ${error.message}`);
-    else uploaded.push(path);
+    /*
+     * safeName has already stripped everything outside [\w.-], and dealId and
+     * category are machine-generated, so the path needs no URL encoding.
+     */
+    else uploaded.push({
+      path,
+      category: photo.category,
+      url: `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${path}`,
+    });
   }
 
   // A zip failure must not discard the files that already uploaded.
@@ -836,7 +847,7 @@ function supabaseRest(path) {
 }
 
 /** Inserts the report row and returns its generated uuid. */
-async function saveInspectionReport({ dealId, fields, damageReport, reportJson, photosUrl }) {
+async function saveInspectionReport({ dealId, fields, damageReport, reportJson, photosUrl, photoUrls }) {
   const { endpoint, headers } = supabaseRest(REPORTS_TABLE);
 
   const res = await fetch(endpoint, {
@@ -846,7 +857,7 @@ async function saveInspectionReport({ dealId, fields, damageReport, reportJson, 
     headers: { ...headers, Prefer: 'return=representation' },
     body: JSON.stringify({
       deal_id: dealId,
-      report_data: { fields, damageReport, reportJson },
+      report_data: { fields, damageReport, reportJson, photoUrls: photoUrls || [] },
       photos_url: photosUrl,
     }),
   });
@@ -916,6 +927,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
   let photosUrl = null;
   let reportId = null;
   let reportUrl = null;
+  let photoUrls = [];
 
   console.log('[inspection] raw body keys:', Object.keys(req.body || {}));
   console.log('[inspection] raw body values:', JSON.stringify(req.body || {}));
@@ -982,8 +994,17 @@ app.post('/inspection', upload.any(), async (req, res) => {
     // Photos are keyed by deal id, so without one there is nowhere to put them.
     if (photos.length && dealId) {
       try {
-        const { failed, photosUrl: zipUrl } = await uploadPhotos(dealId, photos);
+        const { uploaded, failed, photosUrl: zipUrl } = await uploadPhotos(dealId, photos);
         photosUrl = zipUrl;
+
+        /*
+         * The generated PDF rides in as photos_report[], so it lands in the
+         * same bucket as the photos — excluded here so it never shows up in
+         * the report page's gallery.
+         */
+        photoUrls = uploaded
+          .filter(item => item.category !== REPORT_PDF_CATEGORY)
+          .map(({ url, category }) => ({ url, category }));
         if (failed.length) {
           console.error('[inspection] photo uploads failed:', failed);
           notes.push(`${failed.length} of ${photos.length} photos failed to upload`);
@@ -1012,7 +1033,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
      * submission, so it becomes a warning rather than an error.
      */
     try {
-      reportId = await saveInspectionReport({ dealId, fields, damageReport, reportJson, photosUrl });
+      reportId = await saveInspectionReport({ dealId, fields, damageReport, reportJson, photosUrl, photoUrls });
       console.log('[inspection] saved report', reportId, 'for deal', dealId);
     } catch (err) {
       console.error('[inspection] report save failed:', err);
