@@ -1189,18 +1189,28 @@ const REPORT_MODEL = 'claude-sonnet-4-6';
  * The frontend posts raw form fields and gets a parsed report object back.
  */
 function buildReportPrompt(d) {
-  return `You are generating a professional roofing damage report for NÜ HOME, a roofing company in Colorado.
-Based on this inspection data, generate a JSON damage report with these exact keys:
+  return `You are generating a professional roofing damage report for NÜ HOME, a roofing company in western Colorado. This report will be read by homeowners and insurance adjusters. It must be factual, specific, and written to support an insurance claim where warranted.
+
+Generate a JSON damage report with these exact keys:
 {
-  "summary": "2-3 sentence summary of findings and recommended action — professional, factual, no fluff",
+  "summary": "3-4 sentence executive summary. Lead with the storm event and confirmed damage. Reference the specific hail size and how it affects shingle integrity. State clearly whether a claim is warranted and why. Use professional insurance language.",
   "badge": "one of: ACTION REQUIRED | INSURANCE CLAIM RECOMMENDED | RETAIL REPLACEMENT RECOMMENDED | NO ACTION REQUIRED",
   "findings": [
-    { "label": "Finding title", "description": "description of damage found", "severity": "high|medium|low" }
+    { 
+      "label": "Finding title — be specific, e.g. 'Hail Impact — Field Shingles, All Slopes'", 
+      "description": "3-5 sentences. Describe exactly what was observed and where. Explain the functional consequence of this damage (waterproofing integrity, rated service life, accelerated weathering). For hail: explain that impact bruising fractures the shingle mat, displaces protective granules, and exposes the asphalt substrate to UV degradation. For soft metals: explain that fresh dents on vent caps, flashing, and pipe boots confirm the hail event date and size — adjusters use soft metals to corroborate storm damage claims because they cannot be faked or walked on. For granule loss: reference that granules are the shingle's UV shield and their loss accelerates deterioration exponentially. Quantify where possible — reference hail size, number of slopes affected, squares involved.", 
+      "severity": "high|medium|low" 
+    }
   ],
   "recommendations": [
-    { "label": "Recommendation title", "description": "recommendation item", "type": "primary|secondary" }
+    { 
+      "label": "Recommendation title", 
+      "description": "2-3 sentences. Be directive. Reference the specific carrier by name where applicable. Explain what happens if this recommendation is not followed. Use language adjusters recognize — 'insurable loss', 'full replacement vs spot repair', 'storm date', 'scope of loss'.", 
+      "type": "primary|secondary" 
+    }
   ]
 }
+
 Inspection data:
 - Address: ${d.address}
 - Homeowner: ${d.fname} ${d.lname}
@@ -1216,7 +1226,15 @@ Inspection data:
 - Roof age: ${d.roofAge || 'unknown'}
 - Inspector notes: ${d.notes || 'none'}
 - Recommendation: ${d.recommendation}
-- Areas inspected: ${d.checklist ? d.checklist.filter(c => c.checked).map(c => c.label).join(', ') : 'full inspection'}
+- Areas inspected: ${d.checklist ? d.checklist.filter(c => c.checked).map(c => c.label).join(', ') : 'full inspection performed on all accessible roof planes'}
+
+Key guidance:
+- Soft metal damage (vent caps, flashing, pipe boots, gutters) is critical to mention — it is the adjuster's primary tool for confirming hail event date and size. Always explain this if soft metals were inspected.
+- Hail size matters: marble (1/2") causes moderate-severe bruising on standard 3-tab and architectural shingles. Golf ball (1.75") causes severe fracturing. Always connect hail size to expected damage pattern.
+- Roof age matters: a 20+ year roof with storm damage is a replacement, not a repair. Reference manufacturer lifespan.
+- Never recommend spot repair when damage is distributed across multiple slopes.
+- Write findings as if an adjuster will read them and use them to approve or deny a claim.
+
 Return ONLY the JSON object, no markdown, no preamble.`;
 }
 
@@ -1241,7 +1259,15 @@ app.post('/report', async (req, res) => {
       },
       body: JSON.stringify({
         model: REPORT_MODEL,
-        max_tokens: 1000,
+        /*
+         * Raised from 1000 alongside the longer prompt. The report now asks for
+         * a 3-4 sentence summary, 3-5 sentences per finding, and 2-3 per
+         * recommendation, which runs past 1000 tokens on a typical multi-slope
+         * inspection. Truncation lands mid-JSON, so the parse below throws and
+         * the whole call degrades to the frontend's generic fallback report —
+         * silently, and exactly on the detailed reports this prompt is for.
+         */
+        max_tokens: 4000,
         messages: [{ role: 'user', content: buildReportPrompt(inspectionData) }],
       }),
     });
@@ -1258,6 +1284,15 @@ app.post('/report', async (req, res) => {
      */
     if (payload?.stop_reason === 'refusal') {
       throw new Error('Anthropic declined the request.');
+    }
+
+    /*
+     * Truncated output is invalid JSON, and the parse error alone gives no clue
+     * why — name the cause so a future max_tokens squeeze is one log line to
+     * diagnose rather than a mystery fallback report.
+     */
+    if (payload?.stop_reason === 'max_tokens') {
+      throw new Error('Report was truncated at max_tokens — raise the limit.');
     }
 
     const text = (payload?.content || [])
