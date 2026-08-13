@@ -24,6 +24,8 @@ const SCOPE_BUCKET = 'scopes';
 const SCOPE_ZIP_NAME = 'scope.zip';
 // Both stages live in Roofing - Insurance, the pipeline INSPECTION_PIPELINE names.
 const CONTINGENCY_SIGNED_STAGE = '4109489900';
+// Public report page the shareable link points at.
+const REPORT_PAGE_URL = 'https://nuhome-deals-dashboard.vercel.app/inspection-report.html';
 const SCOPE_REVIEW_STAGE = '4109489903';
 
 /*
@@ -913,6 +915,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
   let dealId = null;
   let photosUrl = null;
   let reportId = null;
+  let reportUrl = null;
 
   console.log('[inspection] raw body keys:', Object.keys(req.body || {}));
   console.log('[inspection] raw body values:', JSON.stringify(req.body || {}));
@@ -1016,6 +1019,26 @@ app.post('/inspection', upload.any(), async (req, res) => {
       notes.push('Report was not saved — shareable link unavailable');
     }
 
+    /*
+     * The shareable link, mirrored onto the deal so ops can open the report
+     * from HubSpot without going through the rep. Null whenever the save above
+     * failed — there is no report row to point at.
+     */
+    reportUrl = reportId ? `${REPORT_PAGE_URL}?id=${reportId}` : null;
+
+    if (reportUrl && dealId) {
+      try {
+        assertPipelineAllowed(INSPECTION_PIPELINE);
+        await hubspot(`/crm/v3/objects/deals/${dealId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ properties: { damage_report_url: reportUrl } }),
+        });
+      } catch (err) {
+        console.error('[inspection] could not write damage_report_url:', err);
+        notes.push('Report URL was not written to the deal');
+      }
+    }
+
     // ---- Ops email (always attempted, with whatever survived above) ----
     try {
       await resend.emails.send({
@@ -1033,6 +1056,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
       success: true,
       dealId,
       reportId,
+      reportUrl,
       photosUrl,
       damageReport,
       ...(notes.length ? { warnings: notes } : {}),
@@ -1331,7 +1355,7 @@ app.get('/report/:reportId', async (req, res) => {
 
   try {
     const { endpoint, headers } = supabaseRest(
-      `${REPORTS_TABLE}?id=eq.${encodeURIComponent(reportId)}&select=report_data&limit=1`
+      `${REPORTS_TABLE}?id=eq.${encodeURIComponent(reportId)}&select=report_data,photos_url&limit=1`
     );
     const response = await fetch(endpoint, { headers });
     const rows = await response.json().catch(() => null);
@@ -1343,7 +1367,11 @@ app.get('/report/:reportId', async (req, res) => {
       return res.status(404).json({ error: 'Report not found' });
     }
 
-    return res.json(rows[0].report_data || {});
+    /*
+     * photos_url is a sibling column, not part of report_data — merged in here
+     * so the report page can offer the photo zip without a second request.
+     */
+    return res.json({ ...(rows[0].report_data || {}), photosUrl: rows[0].photos_url || null });
   } catch (err) {
     console.error('[report] fetch failed:', err);
     return res.status(500).json({ error: 'Could not load report' });
