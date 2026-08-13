@@ -1102,6 +1102,103 @@ app.post('/scope', upload.any(), async (req, res) => {
   }
 });
 
+// ---- AI damage report proxy -----------------------------------------------
+const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
+const REPORT_MODEL = 'claude-sonnet-4-6';
+
+/*
+ * The prompt lives here rather than in the browser so the API key never has to.
+ * The frontend posts raw form fields and gets a parsed report object back.
+ */
+function buildReportPrompt(d) {
+  return `You are generating a professional roofing damage report for NÜ HOME, a roofing company in Colorado.
+Based on this inspection data, generate a JSON damage report with these exact keys:
+{
+  "summary": "2-3 sentence summary of findings and recommended action — professional, factual, no fluff",
+  "badge": "one of: ACTION REQUIRED | INSURANCE CLAIM RECOMMENDED | RETAIL REPLACEMENT RECOMMENDED | NO ACTION REQUIRED",
+  "findings": [
+    { "label": "Finding title", "description": "description of damage found", "severity": "high|medium|low" }
+  ],
+  "recommendations": [
+    { "label": "Recommendation title", "description": "recommendation item", "type": "primary|secondary" }
+  ]
+}
+Inspection data:
+- Address: ${d.address}
+- Homeowner: ${d.fname} ${d.lname}
+- Homeowner email: ${d.customer_email || 'not provided'}
+- Carrier: ${d.carrier}
+- Storm date: ${d.stormDate || 'recent storm'}
+- Damage types found: ${d.damagePills ? d.damagePills.join(', ') : 'none specified'}
+- Hail size: ${d.hailSize || 'unknown'}
+- Overall severity: ${d.severity}
+- Roof pitch: ${d.pitch}
+- Stories: ${d.stories}
+- Roof size: ${d.squares ? d.squares + ' squares' : 'unknown'}
+- Roof age: ${d.roofAge || 'unknown'}
+- Inspector notes: ${d.notes || 'none'}
+- Recommendation: ${d.recommendation}
+- Areas inspected: ${d.checklist ? d.checklist.filter(c => c.checked).map(c => c.label).join(', ') : 'full inspection'}
+Return ONLY the JSON object, no markdown, no preamble.`;
+}
+
+/*
+ * Internal use only — no auth. The endpoint holds an API key, so anyone who can
+ * reach it can spend against it; it is not linked from anywhere public, but
+ * that is obscurity, not a control. Add a shared secret if it ever leaks.
+ */
+app.post('/report', async (req, res) => {
+  try {
+    const inspectionData = req.body?.inspectionData;
+    if (!inspectionData || typeof inspectionData !== 'object') {
+      return res.status(400).json({ error: 'inspectionData object is required.' });
+    }
+
+    const response = await fetch(ANTHROPIC_API, {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: REPORT_MODEL,
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: buildReportPrompt(inspectionData) }],
+      }),
+    });
+
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      // Anthropic returns { error: { type, message } } on failure.
+      throw new Error(payload?.error?.message || `Anthropic returned HTTP ${response.status}`);
+    }
+
+    /*
+     * A refusal comes back as a normal 200 with an empty content array, so read
+     * stop_reason before indexing into it.
+     */
+    if (payload?.stop_reason === 'refusal') {
+      throw new Error('Anthropic declined the request.');
+    }
+
+    const text = (payload?.content || [])
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('');
+    if (!text) throw new Error('Anthropic returned no text content.');
+
+    // The model is asked for bare JSON but occasionally wraps it in a fence.
+    const report = JSON.parse(text.replace(/```json|```/g, '').trim());
+
+    console.log('[report] generated for', inspectionData.address || 'unknown address');
+    return res.json(report);
+  } catch (err) {
+    console.error('[report] generation failed:', err);
+    return res.status(500).json({ error: 'Report generation failed' });
+  }
+});
+
 /*
  * Registered last, so it catches what the route handlers cannot: multer rejects
  * a file (bad type, over the size limit) in middleware, before any route runs,
