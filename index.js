@@ -56,20 +56,15 @@ function assertPipelineAllowed(pipelineId) {
 }
 
 /*
- * Per-file cap, enforced by multer itself — it aborts the stream and the global
- * handler turns the MulterError into a 400.
- */
-const MAX_FILE_BYTES = 25 * 1024 * 1024;
-
-/*
- * Total-upload cap. multer has no equivalent option, so each upload route
- * checks it after parsing; see the totalBytes guard in the handlers.
+ * Total-upload cap, checked per route after parsing — multer has no option for
+ * a combined limit. The per-file cap is applied in the handlers too (see the
+ * oversized filter): a single huge photo skips itself rather than failing the
+ * whole submission, which would cost the rep every other file they took.
  */
 const MAX_TOTAL_UPLOAD_BYTES = 200 * 1024 * 1024;
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_FILE_BYTES },
   fileFilter: (req, file, cb) => {
     const allowed = [
       'image/jpeg',
@@ -416,7 +411,20 @@ async function createContingencyDeal(fields, zipUrl) {
 }
 
 app.post('/submit', upload.array('files', 10), async (req, res) => {
-  const totalBytes = (req.files || []).reduce((sum, f) => sum + f.size, 0);
+  /*
+   * Drop files over the per-file cap and keep going. multer no longer enforces
+   * this, so an oversized file arrives fully buffered and is discarded here.
+   */
+  const MAX_FILE_BYTES = 25 * 1024 * 1024;
+  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
+  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
+  req.files = acceptedFiles;
+  if (oversized.length) {
+    console.warn('Skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
+  }
+
+  // Total cap applies to what survived the filter, not what was sent.
+  const totalBytes = acceptedFiles.reduce((sum, f) => sum + f.size, 0);
   if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
     return res.status(400).json({
       success: false,
@@ -942,7 +950,20 @@ function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes)
 }
 
 app.post('/inspection', upload.any(), async (req, res) => {
-  const totalBytes = (req.files || []).reduce((sum, f) => sum + f.size, 0);
+  /*
+   * Drop files over the per-file cap and keep going. multer no longer enforces
+   * this, so an oversized file arrives fully buffered and is discarded here.
+   */
+  const MAX_FILE_BYTES = 25 * 1024 * 1024;
+  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
+  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
+  req.files = acceptedFiles;
+  if (oversized.length) {
+    console.warn('Skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
+  }
+
+  // Total cap applies to what survived the filter, not what was sent.
+  const totalBytes = acceptedFiles.reduce((sum, f) => sum + f.size, 0);
   if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
     return res.status(400).json({
       success: false,
@@ -951,6 +972,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
   }
 
   const notes = [];
+  if (oversized.length) notes.push(`${oversized.length} photo(s) over 25MB were skipped — ask rep to compress before resubmitting`);
   let dealId = null;
   let photosUrl = null;
   let reportId = null;
@@ -1167,7 +1189,20 @@ function scopeEmailHtml(homeownerName, propertyAddress, scopeUrl, submittedDate,
 }
 
 app.post('/scope', upload.any(), async (req, res) => {
-  const totalBytes = (req.files || []).reduce((sum, f) => sum + f.size, 0);
+  /*
+   * Drop files over the per-file cap and keep going. multer no longer enforces
+   * this, so an oversized file arrives fully buffered and is discarded here.
+   */
+  const MAX_FILE_BYTES = 25 * 1024 * 1024;
+  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
+  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
+  req.files = acceptedFiles;
+  if (oversized.length) {
+    console.warn('Skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
+  }
+
+  // Total cap applies to what survived the filter, not what was sent.
+  const totalBytes = acceptedFiles.reduce((sum, f) => sum + f.size, 0);
   if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
     return res.status(400).json({
       success: false,
