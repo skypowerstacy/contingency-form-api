@@ -741,6 +741,8 @@ async function createInspectionDeal(fields, contactId) {
     dealstage: INSPECTION_STAGE,
   };
   if (fields.address) properties.customers_full_address = fields.address;
+  if (fields.phone) properties.customer_cell_phone = fields.phone;
+  if (fields.customer_email) properties.customer_email = fields.customer_email;
   if (carrier) properties.insurance_company = carrier;
   // The form collects one storm date; HubSpot has no storm_date property, so it
   // lands on date_of_loss alone.
