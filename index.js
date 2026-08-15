@@ -21,6 +21,7 @@ const PHOTO_ZIP_NAME = 'inspection-photos.zip';
 // The frontend posts the generated PDF as photos_report[] — same bucket as the
 // photos, but never part of the gallery.
 const REPORT_PDF_CATEGORY = 'report';
+const REPORT_PDF_FIELD = 'photos_report[]';
 const CONTINGENCY_BUCKET = 'contingency';
 const CONTINGENCY_ZIP_NAME = 'contingency-form.zip';
 const SCOPE_BUCKET = 'scopes';
@@ -977,10 +978,14 @@ app.post('/inspection', upload.any(), async (req, res) => {
   /*
    * Drop files over the per-file cap and keep going. multer no longer enforces
    * this, so an oversized file arrives fully buffered and is discarded here.
+   *
+   * The generated report PDF is exempt: it is produced by our own code, not
+   * chosen by the rep, so there is nothing for them to compress if it trips
+   * the cap. It is still bounded by the 100MB multer backstop.
    */
   const MAX_FILE_BYTES = 25 * 1024 * 1024;
-  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
-  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
+  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES && f.fieldname !== REPORT_PDF_FIELD);
+  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES || f.fieldname === REPORT_PDF_FIELD);
   req.files = acceptedFiles;
   if (oversized.length) {
     console.warn('Skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
