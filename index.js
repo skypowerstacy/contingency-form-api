@@ -226,15 +226,56 @@ function addressSlug(value) {
   return slug || 'unknown-address';
 }
 
-/** Tolerates extra unit numbers, missing city, and abbreviation differences. */
-function addressesMatch(a, b) {
-  if (!a || !b) return false;
-  if (a === b || a.includes(b) || b.includes(a)) return true;
+/*
+ * Deal matching is scored rather than boolean: address alone matched the wrong
+ * deal on duplexes and repeat customers at one address, so the homeowner name
+ * is weighed alongside it.
+ */
+const ADDRESS_WEIGHT = 0.6;
+const NAME_WEIGHT = 0.4;
+const MATCH_THRESHOLD = 0.5;
+// No name submitted is not evidence against a candidate, so it scores neutral
+// rather than zero — otherwise a nameless submission would need a near-perfect
+// address just to clear the threshold.
+const NEUTRAL_NAME_SCORE = 0.5;
 
-  const left = new Set(a.split(' '));
-  const right = new Set(b.split(' '));
-  const shared = [...left].filter(token => right.has(token)).length;
-  return shared >= Math.min(left.size, right.size) * 0.8;
+/** Lowercased word tokens. normaliseName() strips spaces, so it cannot tokenize. */
+function nameTokens(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
+ * Fraction of the submitted address's tokens present in the candidate's.
+ * Directional: extra tokens on the HubSpot side (unit numbers, city) cost
+ * nothing, which is what tolerates partial addresses on file.
+ */
+function scoreAddress(submittedNorm, candidateNorm) {
+  const submitted = String(submittedNorm || '').split(' ').filter(Boolean);
+  if (!submitted.length) return 0;
+  const present = new Set(String(candidateNorm || '').split(' ').filter(Boolean));
+  return submitted.filter(token => present.has(token)).length / submitted.length;
+}
+
+/** Fraction of the submitted name's tokens present in the contact's full name. */
+function scoreName(submittedName, contactProperties) {
+  const submitted = nameTokens(submittedName);
+  if (!submitted.length) return NEUTRAL_NAME_SCORE;
+  const present = new Set(
+    nameTokens(`${contactProperties?.firstname || ''} ${contactProperties?.lastname || ''}`)
+  );
+  return submitted.filter(token => present.has(token)).length / submitted.length;
+}
+
+/*
+ * The scope form defaults a blank name to a placeholder for display; reading
+ * req.body directly keeps that placeholder out of the scoring.
+ */
+function submittedHomeownerName(body) {
+  return (body?.homeownerName ?? body?.customerName ?? '').toString().trim();
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
@@ -294,7 +335,7 @@ async function uploadFilesAndZip({ bucket, slug, files, zipName, label, defaultE
  * server-side on the street number (the most selective token) and the fuzzy
  * comparison happens here.
  */
-async function findDealByAddress(rawAddress) {
+async function findDealByAddress(rawAddress, rawName) {
   const target = normaliseAddress(rawAddress);
   if (!target) return null;
 
@@ -310,13 +351,28 @@ async function findDealByAddress(rawAddress) {
     }),
   });
 
-  const candidates = (search?.results || [])
-    .filter(c => addressesMatch(target, normaliseAddress(c.properties?.address)));
+  const round = n => Number(n.toFixed(2));
+
+  const scored = (search?.results || []).map(contact => {
+    const address = scoreAddress(target, normaliseAddress(contact.properties?.address));
+    const name = scoreName(rawName, contact.properties);
+    const combined = (address * ADDRESS_WEIGHT) + (name * NAME_WEIGHT);
+    console.log('[deal-lookup] candidate scores:',
+      { address: round(address), name: round(name), combined: round(combined) },
+      '- contact:', contact.id, JSON.stringify(contact.properties?.address || ''));
+    return { contact, combined };
+  });
+
+  // Highest first, so the best match is tried before any weaker one.
+  const candidates = scored
+    .filter(c => c.combined >= MATCH_THRESHOLD)
+    .sort((a, b) => b.combined - a.combined);
 
   console.log('[deal-lookup] address:', JSON.stringify(target), '- token:', token,
-    '- contacts searched:', (search?.results || []).length, '- address matches:', candidates.length);
+    '- name:', JSON.stringify(rawName || ''),
+    '- contacts searched:', scored.length, '- above threshold:', candidates.length);
 
-  for (const contact of candidates) {
+  for (const { contact } of candidates) {
     const assoc = await hubspot(`/crm/v4/objects/contacts/${contact.id}/associations/deals`);
     for (const row of assoc?.results || []) {
       const dealId = String(row.toObjectId);
@@ -521,7 +577,7 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
     }
 
     try {
-      const deal = await findDealByAddress(propertyAddress);
+      const deal = await findDealByAddress(propertyAddress, submittedHomeownerName(req.body));
       if (deal) {
         await updateContingencyDeal(deal, req.body, zipUrl);
       } else {
@@ -1274,8 +1330,8 @@ app.post('/scope', upload.any(), async (req, res) => {
 
   try {
     const propertyAddress = (req.body?.propertyAddress ?? '').toString().trim();
-    // Display-only: the deal is matched on address, so a missing or misspelled
-    // name never affects the lookup.
+    // Placeholder is display-only. The lookup reads req.body directly so a blank
+    // name scores neutral rather than matching against "Unknown Homeowner".
     const homeownerName = (req.body?.homeownerName ?? '').toString().trim() || 'Unknown Homeowner';
     const files = req.files || [];
 
@@ -1315,7 +1371,7 @@ app.post('/scope', upload.any(), async (req, res) => {
 
     // ---- HubSpot ----
     try {
-      const deal = await findDealByAddress(propertyAddress);
+      const deal = await findDealByAddress(propertyAddress, submittedHomeownerName(req.body));
       if (deal) {
         await updateScopeDeal(deal, scopeUrl);
         dealId = deal.dealId;
