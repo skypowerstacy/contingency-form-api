@@ -713,11 +713,11 @@ function normaliseName(value) {
  * HubSpot and would fail the whole deal write. Resolve the rep name against the
  * live option list and drop the property when nothing matches.
  */
-async function resolveCloserOption(repName) {
-  if (!repName) return null;
-  const property = await hubspot('/crm/v3/properties/deals/closer');
+async function resolveDealEnumOption(propertyName, personName) {
+  if (!personName) return null;
+  const property = await hubspot(`/crm/v3/properties/deals/${propertyName}`);
   const options = property?.options || [];
-  const target = normaliseName(repName);
+  const target = normaliseName(personName);
   if (!target) return null;
 
   const exact = options.find(o => normaliseName(o.label) === target || normaliseName(o.value) === target);
@@ -728,6 +728,14 @@ async function resolveCloserOption(repName) {
     return label && (label.includes(target) || target.includes(label));
   });
   return partial ? partial.value : null;
+}
+
+async function resolveCloserOption(repName) {
+  return resolveDealEnumOption('closer', repName);
+}
+
+async function resolveSetterOption(setterName) {
+  return resolveDealEnumOption('setter', setterName);
 }
 
 async function createInspectionDeal(fields, contactId) {
@@ -759,6 +767,20 @@ async function createInspectionDeal(fields, contactId) {
     closerWarning = `Could not resolve "closer" options: ${err.message}`;
   }
 
+  /*
+   * Same shape as closer: setter is an enumeration, so an unrecognised string
+   * would be rejected by HubSpot and fail the whole deal write. Resolve against
+   * the live option list and drop the property when nothing matches.
+   */
+  let setterWarning = null;
+  try {
+    const setter = await resolveSetterOption(fields.setter);
+    if (setter) properties.setter = setter;
+    else if (fields.setter) setterWarning = `No "setter" option matched "${fields.setter}" — property omitted.`;
+  } catch (err) {
+    setterWarning = `Could not resolve "setter" options: ${err.message}`;
+  }
+
   const deal = await hubspot('/crm/v3/objects/deals', {
     method: 'POST',
     body: JSON.stringify({ properties }),
@@ -771,7 +793,7 @@ async function createInspectionDeal(fields, contactId) {
     );
   }
 
-  return { dealId: deal.id, closerWarning };
+  return { dealId: deal.id, closerWarning, setterWarning };
 }
 
 /*
@@ -930,7 +952,9 @@ function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes)
     ['Phone', fields.phone],
     ['Email', fields.customer_email],
     ['Insurance carrier', fields.carrier],
-    ['Inspector / rep', fields.rep],
+    ['Closer', fields.rep],
+    ['Setter', fields.setter],
+    ['Inspection Performed By', fields.inspector],
     ['Storm date', fields.stormDate],
     ['Hail size', fields.hailSize],
     ['Roof pitch', fields.pitch],
@@ -1012,6 +1036,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
 
   const FIELDS = [
     'address', 'fname', 'lname', 'phone', 'customer_email', 'carrier', 'rep',
+    'setter', 'inspector',
     'stormDate', 'hailSize', 'pitch', 'stories', 'squares', 'roofAge',
     'severity', 'mortgage', 'recommendation', 'notes', 'inspectionDate',
   ];
@@ -1061,6 +1086,10 @@ app.post('/inspection', upload.any(), async (req, res) => {
       if (result.closerWarning) {
         console.warn('[inspection]', result.closerWarning);
         notes.push(result.closerWarning);
+      }
+      if (result.setterWarning) {
+        console.warn('[inspection]', result.setterWarning);
+        notes.push(result.setterWarning);
       }
     } catch (err) {
       console.error('[inspection] deal creation failed:', err);
