@@ -1364,7 +1364,7 @@ async function updateRetailDeal(deal, fields, people) {
     body: JSON.stringify({ properties }),
   });
 
-  console.log('[retail-inspection] updated deal', deal.dealId, 'with', Object.keys(properties).join(', '));
+  console.log('[retail-submission] updated deal', deal.dealId, 'with', Object.keys(properties).join(', '));
   return { dealId: deal.dealId, contactId: deal.contactId };
 }
 
@@ -1395,7 +1395,7 @@ async function createRetailDeal(fields, people) {
     );
   }
 
-  console.log('[retail-inspection] created deal', deal.id, 'and contact', contactId, 'with', Object.keys(properties).join(', '));
+  console.log('[retail-submission] created deal', deal.id, 'and contact', contactId, 'with', Object.keys(properties).join(', '));
   return { dealId: deal.id, contactId };
 }
 
@@ -1442,7 +1442,7 @@ function retailEmailHtml(fields, sectionUrls, dealId, warnings) {
   return `
     <div style="font-family: sans-serif; max-width: 640px; margin: 0 auto;">
       <div style="background:#1B2A4A;padding:24px;border-radius:8px 8px 0 0">
-        <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — Retail Inspection Submitted</h1>
+        <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — Retail Submission Submitted</h1>
       </div>
       <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
         <table style="width:100%;border-collapse:collapse">${rows}</table>
@@ -1465,7 +1465,7 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
   const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
   req.files = acceptedFiles;
   if (oversized.length) {
-    console.warn('[retail-inspection] skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
+    console.warn('[retail-submission] skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
   }
 
   // Total cap applies to what survived the filter, not what was sent.
@@ -1524,13 +1524,13 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
       });
     }
 
-    console.log('[retail-inspection] files received:',
+    console.log('[retail-submission] files received:',
       RETAIL_SECTIONS.map(s => `${s.field}=${filesBySection[s.field].length}`).join(' '));
 
     // ---- HubSpot: resolve people, then find or create the deal ----
     const people = await resolveRetailPeople(fields);
     for (const warning of people.warnings) {
-      console.warn('[retail-inspection]', warning);
+      console.warn('[retail-submission]', warning);
       warnings.push(warning);
     }
 
@@ -1544,7 +1544,7 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
         dealId = result.dealId;
       }
     } catch (err) {
-      console.error('[retail-inspection] HubSpot deal write failed:', err);
+      console.error('[retail-submission] HubSpot deal write failed:', err);
       warnings.push('HubSpot deal was not created or updated');
     }
 
@@ -1558,15 +1558,15 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
             slug: `${dealId}/${section.folder}`,
             files: filesBySection[section.field],
             zipName: section.zipName,
-            label: `[retail-inspection] ${section.label}`,
+            label: `[retail-submission] ${section.label}`,
           });
           sectionUrls[section.field] = result.zipUrl;
           if (result.failed.length) {
-            console.error(`[retail-inspection] ${section.label} storage failures:`, result.failed);
+            console.error(`[retail-submission] ${section.label} storage failures:`, result.failed);
             warnings.push(`${result.failed.length} ${section.label.toLowerCase()} file(s) failed to upload`);
           }
         } catch (err) {
-          console.error(`[retail-inspection] ${section.label} upload failed:`, err);
+          console.error(`[retail-submission] ${section.label} upload failed:`, err);
           warnings.push(`${section.label} was not uploaded to storage`);
         }
       }
@@ -1585,7 +1585,7 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
             body: JSON.stringify({ properties: urlProperties }),
           });
         } catch (err) {
-          console.error('[retail-inspection] could not write file URLs:', err);
+          console.error('[retail-submission] could not write file URLs:', err);
           warnings.push('File URLs were not written to the deal');
         }
       }
@@ -1598,11 +1598,11 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
       await resend.emails.send({
         from: 'NuHome Forms <noreply@thehiveoffice.com>',
         to: ['misty@thenuhome.com', 'mariah@thenuhome.com'],
-        subject: `New Retail Inspection — ${fields.customerName || 'Unknown'} | ${fields.propertyAddress}`,
+        subject: `New Retail Submission — ${fields.customerName || 'Unknown'} | ${fields.propertyAddress}`,
         html: retailEmailHtml(fields, sectionUrls, dealId, warnings),
       });
     } catch (err) {
-      console.error('[retail-inspection] ops email failed:', err);
+      console.error('[retail-submission] ops email failed:', err);
       warnings.push('Ops email was not sent');
     }
 
@@ -1616,7 +1616,7 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[retail-inspection] unhandled error:', err);
+    console.error('[retail-submission] unhandled error:', err);
     // Never a bare 500 — the browser always gets JSON it can render.
     return res.status(500).json({
       success: false,
