@@ -32,6 +32,39 @@ const CONTINGENCY_SIGNED_STAGE = '4109489900';
 const REPORT_PAGE_URL = 'https://nuhome-deals-dashboard.vercel.app/inspection-report.html';
 const SCOPE_REVIEW_STAGE = '4109489903';
 
+// ---- Retail inspection endpoint constants ----------------------------------
+const RETAIL_PIPELINE = '2477633213'; // Roofing - Retail
+const RETAIL_STAGE = '4106670802';    // Intake
+/*
+ * Each documents section is zipped and stored on its own, so a rep can replace
+ * the estimate without touching the measurement report. folder is the path
+ * under {dealId}/ in PHOTO_BUCKET; property is where the zip URL lands on the
+ * deal.
+ */
+const RETAIL_SECTIONS = [
+  {
+    field: 'measurement_report',
+    folder: 'measurement-report',
+    zipName: 'measurement-report.zip',
+    label: 'Measurement report',
+    property: 'measurement_report_url',
+  },
+  {
+    field: 'signed_estimate',
+    folder: 'signed-estimate',
+    zipName: 'signed-estimate.zip',
+    label: 'Signed estimate',
+    property: 'signed_estimate_url',
+  },
+  {
+    field: 'site_photos',
+    folder: 'site-photos',
+    zipName: 'site-photos.zip',
+    label: 'Site photos',
+    property: 'retail_photos_url',
+  },
+];
+
 /*
  * Ops/Install. Sales deals live here and the Deals Dashboard reads from it —
  * nothing in this service may ever write to it. This is the same guard the
@@ -39,20 +72,27 @@ const SCOPE_REVIEW_STAGE = '4109489903';
  */
 const FORBIDDEN_PIPELINE = '1022523097';
 
+/*
+ * Every pipeline this service is allowed to write to. Adding one here is the
+ * only way to widen the guard — FORBIDDEN_PIPELINE is checked first and
+ * separately, so it stays refused even if it were ever added by mistake.
+ */
+const ALLOWED_PIPELINES = new Set([INSPECTION_PIPELINE, RETAIL_PIPELINE]);
+
 /**
- * Throws unless the target pipeline is the inspection pipeline. Called before
- * every deal write rather than once at boot, so a future code path cannot
- * route around it by constructing its own payload.
+ * Throws unless the target pipeline is one this service may write to. Called
+ * before every deal write rather than once at boot, so a future code path
+ * cannot route around it by constructing its own payload.
  */
 function assertPipelineAllowed(pipelineId) {
   const id = String(pipelineId);
   if (id === FORBIDDEN_PIPELINE) {
     throw new Error(
-      `Refusing to write to pipeline ${FORBIDDEN_PIPELINE} (Ops/Install). This endpoint only writes to ${INSPECTION_PIPELINE}.`
+      `Refusing to write to pipeline ${FORBIDDEN_PIPELINE} (Ops/Install). This service only writes to ${[...ALLOWED_PIPELINES].join(', ')}.`
     );
   }
-  if (id !== INSPECTION_PIPELINE) {
-    throw new Error(`Unexpected pipeline ${id}. This endpoint only writes to ${INSPECTION_PIPELINE}.`);
+  if (!ALLOWED_PIPELINES.has(id)) {
+    throw new Error(`Unexpected pipeline ${id}. This service only writes to ${[...ALLOWED_PIPELINES].join(', ')}.`);
   }
 }
 
@@ -327,7 +367,7 @@ async function uploadFilesAndZip({ bucket, slug, files, zipName, label, defaultE
  * server-side on the street number (the most selective token) and the fuzzy
  * comparison happens here.
  */
-async function findDealByAddress(rawAddress, rawName) {
+async function findDealByAddress(rawAddress, rawName, pipelineId = INSPECTION_PIPELINE) {
   const target = normaliseAddress(rawAddress);
   if (!target) return null;
 
@@ -370,7 +410,7 @@ async function findDealByAddress(rawAddress, rawName) {
       const dealId = String(row.toObjectId);
       const deal = await hubspot(`/crm/v3/objects/deals/${dealId}?properties=pipeline,dealstage,dealname`);
       const pipeline = String(deal?.properties?.pipeline || '');
-      if (pipeline === INSPECTION_PIPELINE) {
+      if (pipeline === String(pipelineId)) {
         return { dealId, pipeline, contactId: contact.id, dealname: deal?.properties?.dealname };
       }
     }
@@ -1242,6 +1282,346 @@ app.post('/inspection', upload.any(), async (req, res) => {
       error: err.message || 'Inspection submission failed.',
       dealId,
       photosUrl,
+    });
+  }
+});
+
+// ===========================================================================
+// /retail-inspection — retail (non-insurance) site inspection intake
+//
+// Files and HubSpot only: no AI report, no PDF, no report row. The three
+// document sections are zipped and stored separately so each has its own URL
+// on the deal.
+// ===========================================================================
+
+/** Builds the deal properties shared by the create and update paths. */
+function retailDealProperties(fields, { closer, setter }) {
+  const properties = {
+    pipeline: RETAIL_PIPELINE,
+    dealstage: RETAIL_STAGE,
+  };
+
+  const dealname = String(fields.customerName || '').trim();
+  if (dealname) properties.dealname = dealname;
+
+  // Every field below is optional — write it when the rep filled it in, leave
+  // whatever HubSpot already holds when they did not.
+  if (fields.propertyAddress) properties.customers_full_address = fields.propertyAddress;
+  if (fields.customerPhone) properties.customer_cell_phone = fields.customerPhone;
+  if (fields.customerEmail) properties.customer_email = fields.customerEmail;
+  if (fields.roofType) properties.roof_type = fields.roofType;
+  if (fields.shingleColor) properties.shingle_color = fields.shingleColor;
+  if (fields.dripEdgeColor) properties.drip_edge_color = fields.dripEdgeColor;
+  if (fields.squares) properties.number_of_squares = fields.squares;
+  if (fields.roofPitch) properties.roof_pitch = fields.roofPitch;
+  if (fields.financingType) properties.financing_type = fields.financingType;
+  if (closer) properties.closer = closer;
+  if (setter) properties.setter = setter;
+
+  return properties;
+}
+
+/**
+ * Resolves repName/setterName against the live HubSpot enumerations, exactly
+ * as /inspection does. A name that matches nothing drops the property rather
+ * than failing the deal write, and says so in the warnings.
+ */
+async function resolveRetailPeople(fields) {
+  const warnings = [];
+  let closer = null;
+  let setter = null;
+
+  try {
+    closer = await resolveCloserOption(fields.repName);
+    if (!closer && fields.repName) {
+      warnings.push(`No "closer" option matched rep "${fields.repName}" — property omitted.`);
+    }
+  } catch (err) {
+    warnings.push(`Could not resolve "closer" options: ${err.message}`);
+  }
+
+  try {
+    setter = await resolveSetterOption(fields.setterName);
+    if (!setter && fields.setterName) {
+      warnings.push(`No "setter" option matched "${fields.setterName}" — property omitted.`);
+    }
+  } catch (err) {
+    warnings.push(`Could not resolve "setter" options: ${err.message}`);
+  }
+
+  return { closer, setter, warnings };
+}
+
+async function updateRetailDeal(deal, fields, people) {
+  // Asserted against the pipeline HubSpot reports for this deal, not our own
+  // constant, so a deal in the forbidden pipeline can never be patched.
+  assertPipelineAllowed(deal.pipeline);
+
+  const properties = retailDealProperties(fields, people);
+  await hubspot(`/crm/v3/objects/deals/${deal.dealId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties }),
+  });
+
+  console.log('[retail-inspection] updated deal', deal.dealId, 'with', Object.keys(properties).join(', '));
+  return { dealId: deal.dealId, contactId: deal.contactId };
+}
+
+async function createRetailDeal(fields, people) {
+  assertPipelineAllowed(RETAIL_PIPELINE);
+
+  const { fname, lname } = splitCustomerName(fields.customerName);
+  const contactId = await upsertContact({
+    fname,
+    lname,
+    customer_email: fields.customerEmail,
+    phone: fields.customerPhone,
+    address: fields.propertyAddress,
+  });
+
+  const properties = retailDealProperties(fields, people);
+  if (!properties.dealname) properties.dealname = 'Unknown homeowner';
+
+  const deal = await hubspot('/crm/v3/objects/deals', {
+    method: 'POST',
+    body: JSON.stringify({ properties }),
+  });
+
+  if (contactId) {
+    await hubspot(
+      `/crm/v4/objects/deals/${deal.id}/associations/default/contacts/${contactId}`,
+      { method: 'PUT' }
+    );
+  }
+
+  console.log('[retail-inspection] created deal', deal.id, 'and contact', contactId, 'with', Object.keys(properties).join(', '));
+  return { dealId: deal.id, contactId };
+}
+
+function retailEmailHtml(fields, sectionUrls, dealId, warnings) {
+  const rows = [
+    ['Customer', fields.customerName],
+    ['Property address', fields.propertyAddress],
+    ['Phone', fields.customerPhone],
+    ['Email', fields.customerEmail],
+    ['Closer', fields.repName],
+    ['Setter', fields.setterName],
+    ['Roof type', fields.roofType],
+    ['Shingle color', fields.shingleColor],
+    ['Drip edge color', fields.dripEdgeColor],
+    ['Squares', fields.squares],
+    ['Pitch', fields.roofPitch],
+    ['Financing type', fields.financingType],
+    ['Notes / expectations', fields.notes],
+  ]
+    .map(([label, value]) => `
+      <tr>
+        <td style="padding:6px 12px 6px 0;color:#6b7280;font-size:13px;vertical-align:top;white-space:nowrap">${escapeHtml(label)}</td>
+        <td style="padding:6px 0;color:#111827;font-size:13px">${escapeHtml(value || '—')}</td>
+      </tr>`)
+    .join('');
+
+  const fileLinks = RETAIL_SECTIONS
+    .map(section => {
+      const url = sectionUrls[section.field];
+      return url
+        ? `<p style="margin:6px 0;font-size:13px"><a href="${escapeHtml(url)}" style="color:#C9922A">${escapeHtml(section.label)} →</a></p>`
+        : `<p style="margin:6px 0;color:#6b7280;font-size:13px">${escapeHtml(section.label)} — storage link unavailable.</p>`;
+    })
+    .join('');
+
+  const dealBlock = dealId
+    ? `<p style="margin:16px 0 0;font-size:13px"><a href="https://app.hubspot.com/contacts/deals/${escapeHtml(dealId)}" style="color:#C9922A">Open the HubSpot deal →</a></p>`
+    : `<p style="margin:16px 0 0;color:#6b7280;font-size:13px">HubSpot deal unavailable.</p>`;
+
+  const noteBlock = warnings.length
+    ? `<p style="margin:16px 0 0;color:#b45309;font-size:12px">Partial submission — ${escapeHtml(warnings.join(' · '))}</p>`
+    : '';
+
+  return `
+    <div style="font-family: sans-serif; max-width: 640px; margin: 0 auto;">
+      <div style="background:#1B2A4A;padding:24px;border-radius:8px 8px 0 0">
+        <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — Retail Inspection Submitted</h1>
+      </div>
+      <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
+        <table style="width:100%;border-collapse:collapse">${rows}</table>
+        <h2 style="font-size:14px;margin:24px 0 8px;color:#111827">Documents &amp; photos</h2>
+        ${fileLinks}
+        ${dealBlock}
+        ${noteBlock}
+      </div>
+    </div>
+  `;
+}
+
+app.post('/retail-inspection', upload.any(), async (req, res) => {
+  /*
+   * Drop files over the per-file cap and keep going, same as /inspection:
+   * multer does not enforce it, so an oversized file arrives fully buffered
+   * and is discarded here rather than failing the whole submission.
+   */
+  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
+  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
+  req.files = acceptedFiles;
+  if (oversized.length) {
+    console.warn('[retail-inspection] skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
+  }
+
+  // Total cap applies to what survived the filter, not what was sent.
+  const totalBytes = acceptedFiles.reduce((sum, f) => sum + f.size, 0);
+  if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
+    return res.status(400).json({
+      success: false,
+      error: 'FILE_TOO_LARGE',
+      message: 'Total upload size exceeds 200MB. Please remove some files and try again.',
+    });
+  }
+
+  const warnings = [];
+  if (oversized.length) {
+    warnings.push(`${oversized.length} file(s) over 25MB were skipped — ask rep to compress before resubmitting`);
+  }
+
+  let dealId = null;
+  const sectionUrls = {};
+
+  const FIELDS = [
+    'repName', 'setterName', 'customerName', 'customerPhone', 'customerEmail',
+    'propertyAddress', 'roofType', 'shingleColor', 'dripEdgeColor', 'squares',
+    'roofPitch', 'financingType', 'notes',
+  ];
+
+  try {
+    const fields = {};
+    for (const key of FIELDS) fields[key] = (req.body?.[key] ?? '').toString().trim();
+
+    if (!fields.repName) {
+      return res.status(400).json({ success: false, error: 'Rep name is required.' });
+    }
+    if (!fields.propertyAddress) {
+      return res.status(400).json({ success: false, error: 'Property address is required.' });
+    }
+
+    // Accepts the fieldname with or without the [] suffix the browser sends.
+    const filesBySection = {};
+    for (const section of RETAIL_SECTIONS) {
+      filesBySection[section.field] = (req.files || []).filter(file => {
+        const name = String(file.fieldname || '').replace(/\[\]$/, '');
+        return name === section.field;
+      });
+    }
+
+    const missing = RETAIL_SECTIONS.filter(s => !filesBySection[s.field].length);
+    if (missing.length) {
+      return res.status(400).json({
+        success: false,
+        // Oversized files are dropped before this check, so a section can be
+        // empty here purely because everything in it was too large.
+        error: oversized.length
+          ? `No usable files for: ${missing.map(s => s.label).join(', ')}. Files over 25MB were skipped — compress and resubmit.`
+          : `At least one file is required for: ${missing.map(s => s.label).join(', ')}.`,
+      });
+    }
+
+    console.log('[retail-inspection] files received:',
+      RETAIL_SECTIONS.map(s => `${s.field}=${filesBySection[s.field].length}`).join(' '));
+
+    // ---- HubSpot: resolve people, then find or create the deal ----
+    const people = await resolveRetailPeople(fields);
+    for (const warning of people.warnings) {
+      console.warn('[retail-inspection]', warning);
+      warnings.push(warning);
+    }
+
+    try {
+      const existing = await findDealByAddress(fields.propertyAddress, fields.customerName, RETAIL_PIPELINE);
+      if (existing) {
+        const result = await updateRetailDeal(existing, fields, people);
+        dealId = result.dealId;
+      } else {
+        const result = await createRetailDeal(fields, people);
+        dealId = result.dealId;
+      }
+    } catch (err) {
+      console.error('[retail-inspection] HubSpot deal write failed:', err);
+      warnings.push('HubSpot deal was not created or updated');
+    }
+
+    // ---- Supabase: one zip per section, filed under the deal ----
+    // Keyed by deal id, so without one there is nowhere to put them.
+    if (dealId) {
+      for (const section of RETAIL_SECTIONS) {
+        try {
+          const result = await uploadFilesAndZip({
+            bucket: PHOTO_BUCKET,
+            slug: `${dealId}/${section.folder}`,
+            files: filesBySection[section.field],
+            zipName: section.zipName,
+            label: `[retail-inspection] ${section.label}`,
+          });
+          sectionUrls[section.field] = result.zipUrl;
+          if (result.failed.length) {
+            console.error(`[retail-inspection] ${section.label} storage failures:`, result.failed);
+            warnings.push(`${result.failed.length} ${section.label.toLowerCase()} file(s) failed to upload`);
+          }
+        } catch (err) {
+          console.error(`[retail-inspection] ${section.label} upload failed:`, err);
+          warnings.push(`${section.label} was not uploaded to storage`);
+        }
+      }
+
+      // Written after the uploads because the URLs are only known once the
+      // zips exist. Only the sections that produced a URL are patched.
+      const urlProperties = {};
+      for (const section of RETAIL_SECTIONS) {
+        if (sectionUrls[section.field]) urlProperties[section.property] = sectionUrls[section.field];
+      }
+      if (Object.keys(urlProperties).length) {
+        try {
+          assertPipelineAllowed(RETAIL_PIPELINE);
+          await hubspot(`/crm/v3/objects/deals/${dealId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ properties: urlProperties }),
+          });
+        } catch (err) {
+          console.error('[retail-inspection] could not write file URLs:', err);
+          warnings.push('File URLs were not written to the deal');
+        }
+      }
+    } else {
+      warnings.push('Files were not uploaded — no deal id to file them under');
+    }
+
+    // ---- Ops email (always attempted, with whatever survived above) ----
+    try {
+      await resend.emails.send({
+        from: 'NuHome Forms <noreply@thehiveoffice.com>',
+        to: ['misty@thenuhome.com', 'mariah@thenuhome.com'],
+        subject: `New Retail Inspection — ${fields.customerName || 'Unknown'} | ${fields.propertyAddress}`,
+        html: retailEmailHtml(fields, sectionUrls, dealId, warnings),
+      });
+    } catch (err) {
+      console.error('[retail-inspection] ops email failed:', err);
+      warnings.push('Ops email was not sent');
+    }
+
+    return res.json({
+      success: true,
+      dealId,
+      measurementReportUrl: sectionUrls.measurement_report || null,
+      signedEstimateUrl: sectionUrls.signed_estimate || null,
+      sitePhotosUrl: sectionUrls.site_photos || null,
+      ...(warnings.length ? { warnings } : {}),
+    });
+
+  } catch (err) {
+    console.error('[retail-inspection] unhandled error:', err);
+    // Never a bare 500 — the browser always gets JSON it can render.
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Retail inspection submission failed.',
+      dealId,
+      warnings,
     });
   }
 });
