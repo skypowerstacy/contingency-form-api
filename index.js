@@ -1287,7 +1287,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
 });
 
 // ===========================================================================
-// /retail-inspection — retail (non-insurance) site inspection intake
+// /retail-submission — retail (non-insurance) site inspection intake
 //
 // Files and HubSpot only: no AI report, no PDF, no report row. The three
 // document sections are zipped and stored separately so each has its own URL
@@ -1315,6 +1315,7 @@ function retailDealProperties(fields, { closer, setter }) {
   if (fields.squares) properties.number_of_squares = fields.squares;
   if (fields.roofPitch) properties.roof_pitch = fields.roofPitch;
   if (fields.financingType) properties.financing_type = fields.financingType;
+  if (fields.notes) properties.roofing_notes = fields.notes;
   if (closer) properties.closer = closer;
   if (setter) properties.setter = setter;
 
@@ -1454,7 +1455,7 @@ function retailEmailHtml(fields, sectionUrls, dealId, warnings) {
   `;
 }
 
-app.post('/retail-inspection', upload.any(), async (req, res) => {
+app.post('/retail-submission', upload.any(), async (req, res) => {
   /*
    * Drop files over the per-file cap and keep going, same as /inspection:
    * multer does not enforce it, so an oversized file arrives fully buffered
