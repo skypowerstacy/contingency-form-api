@@ -489,7 +489,8 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
   if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
     return res.status(400).json({
       success: false,
-      error: 'Total upload size exceeds 200MB. Please reduce the number or size of files.',
+      error: 'FILE_TOO_LARGE',
+      message: 'Total upload size exceeds 200MB. Please remove some photos and try again.',
     });
   }
 
@@ -1049,13 +1050,10 @@ app.post('/inspection', upload.any(), async (req, res) => {
   /*
    * Drop files over the per-file cap and keep going. multer no longer enforces
    * this, so an oversized file arrives fully buffered and is discarded here.
-   *
-   * The generated report PDF is exempt: it is produced by our own code, not
-   * chosen by the rep, so there is nothing for them to compress if it trips
-   * the cap. It is still bounded by the 100MB multer backstop.
+   * The generated report PDF is subject to the same cap as the photos.
    */
-  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES && f.fieldname !== REPORT_PDF_FIELD);
-  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES || f.fieldname === REPORT_PDF_FIELD);
+  const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
+  const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
   req.files = acceptedFiles;
   if (oversized.length) {
     console.warn('Skipped oversized files:', oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
@@ -1066,7 +1064,8 @@ app.post('/inspection', upload.any(), async (req, res) => {
   if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
     return res.status(400).json({
       success: false,
-      error: 'Total upload size exceeds 200MB. Please reduce the number or size of files.',
+      error: 'FILE_TOO_LARGE',
+      message: 'Total upload size exceeds 200MB. Please remove some photos and try again.',
     });
   }
 
@@ -1309,7 +1308,8 @@ app.post('/scope', upload.any(), async (req, res) => {
   if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
     return res.status(400).json({
       success: false,
-      error: 'Total upload size exceeds 200MB. Please reduce the number or size of files.',
+      error: 'FILE_TOO_LARGE',
+      message: 'Total upload size exceeds 200MB. Please remove some photos and try again.',
     });
   }
 
