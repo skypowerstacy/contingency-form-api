@@ -32,7 +32,7 @@ const CONTINGENCY_SIGNED_STAGE = '4109489900';
 const REPORT_PAGE_URL = 'https://nuhome-deals-dashboard.vercel.app/inspection-report.html';
 const SCOPE_REVIEW_STAGE = '4109489903';
 
-// ---- Retail inspection endpoint constants ----------------------------------
+// ---- Retail submission endpoint constants ----------------------------------
 const RETAIL_PIPELINE = '2477633213'; // Roofing - Retail
 const RETAIL_STAGE = '4106670802';    // Intake
 /*
@@ -1620,7 +1620,7 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
     // Never a bare 500 — the browser always gets JSON it can render.
     return res.status(500).json({
       success: false,
-      error: err.message || 'Retail inspection submission failed.',
+      error: err.message || 'Retail submission failed.',
       dealId,
       warnings,
     });
