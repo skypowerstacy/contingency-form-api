@@ -63,22 +63,14 @@ function assertPipelineAllowed(pipelineId) {
 const MAX_TOTAL_UPLOAD_BYTES = 200 * 1024 * 1024;
 
 /*
- * Per-file size is enforced in two tiers, because storage is in-memory and a
- * file is fully buffered before any handler code runs:
- *
- *   100MB (here)  multer aborts the stream mid-upload, so a pathological file
- *                 never fills RAM. Nothing recoverable happens at this size.
- *   25MB (handlers)  the graceful tier — the file arrives, is discarded, and
- *                 the rest of the submission proceeds with a warning.
- *
- * Files between the two skip themselves; files above the backstop fail the
- * request via the MulterError path, which is the trade for not OOMing.
+ * Per-file cap, applied by each upload route after parsing rather than by
+ * multer: an oversized file skips itself and the rest of the submission goes
+ * through, instead of the whole request failing on one bad photo.
  */
-const MULTER_ABORT_BYTES = 100 * 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MULTER_ABORT_BYTES },
   fileFilter: (req, file, cb) => {
     const allowed = [
       'image/jpeg',
@@ -485,7 +477,6 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
    * Drop files over the per-file cap and keep going. multer no longer enforces
    * this, so an oversized file arrives fully buffered and is discarded here.
    */
-  const MAX_FILE_BYTES = 25 * 1024 * 1024;
   const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
   const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
   req.files = acceptedFiles;
@@ -1063,7 +1054,6 @@ app.post('/inspection', upload.any(), async (req, res) => {
    * chosen by the rep, so there is nothing for them to compress if it trips
    * the cap. It is still bounded by the 100MB multer backstop.
    */
-  const MAX_FILE_BYTES = 25 * 1024 * 1024;
   const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES && f.fieldname !== REPORT_PDF_FIELD);
   const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES || f.fieldname === REPORT_PDF_FIELD);
   req.files = acceptedFiles;
@@ -1307,7 +1297,6 @@ app.post('/scope', upload.any(), async (req, res) => {
    * Drop files over the per-file cap and keep going. multer no longer enforces
    * this, so an oversized file arrives fully buffered and is discarded here.
    */
-  const MAX_FILE_BYTES = 25 * 1024 * 1024;
   const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
   const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
   req.files = acceptedFiles;
@@ -1596,6 +1585,22 @@ app.get('/report/:reportId', async (req, res) => {
  */
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err.message || err);
+
+  /*
+   * A machine-readable code plus a sentence the rep can act on — multer's own
+   * message is just "File too large", which names no file and no limit.
+   *
+   * Currently unreachable: limits.fileSize is not set, so multer never raises
+   * LIMIT_FILE_SIZE. Kept so the branch is correct if a cap is reintroduced.
+   */
+  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({
+      success: false,
+      error: 'FILE_TOO_LARGE',
+      message: 'A file exceeded the maximum allowed size. Please remove large files and try again.',
+    });
+  }
+
   const status = err instanceof multer.MulterError ? 400 : (err.status || 500);
   res.status(status).json({ success: false, error: err.message || 'Internal server error' });
 });
