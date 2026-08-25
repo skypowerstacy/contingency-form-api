@@ -133,39 +133,28 @@ const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  fileFilter: (req, file, cb) => {
-    const allowed = [
-      'image/jpeg',
-      'image/jpg',
-      'image/png',
-      'image/heic',
-      'image/heif',
-      'image/heif-sequence',
-      'image/heic-sequence',
-      'application/pdf',
-    ];
-
-    /*
-     * Browsers disagree on HEIC in particular — the same photo off an iPhone can
-     * arrive as image/heic, application/octet-stream, or an empty mimetype
-     * depending on the browser. Falling back to the extension means a rep does
-     * not lose a legitimate roof photo to a header we cannot control.
-     */
-    const allowedExtension = /\.(jpe?g|png|heic|pdf)$/i;
-
-    // Strip any parameters, e.g. "image/jpeg; charset=utf-8".
-    const mimetype = (file.mimetype || '').split(';')[0].trim();
-
-    if (allowed.includes(mimetype) || allowedExtension.test(file.originalname || '')) {
-      cb(null, true);
-    } else {
-      // Not a MulterError, so the global handler cannot infer this is the
-      // caller's fault — tag it explicitly or it reports as a 500.
-      const err = new Error('Only JPG, PNG, HEIC, and PDF files are accepted.');
-      err.status = 400;
-      cb(err);
-    }
-  }
+  /*
+   * Deliberately accepts everything. This is a policy decision, not an
+   * oversight — please do not reinstate a type check here.
+   *
+   * The costs are wildly asymmetric. A rejected file fails the whole request
+   * before any route runs, and the rep loses the entire inspection: every
+   * field, every other photo, and the trip onto the roof. A file of the wrong
+   * type that gets through costs, at worst, one missing image in the PDF —
+   * which is soft-skipped with a warning, still lands in storage, and can be
+   * sorted out afterwards without the rep involved.
+   *
+   * The old filter was also unreliable at exactly the job it existed for: the
+   * same iPhone photo arrives as image/heic, application/octet-stream, or an
+   * empty mimetype depending on the browser, and its extension fallback
+   * covered .heic but not .heif — so a legitimate roof photo could be refused
+   * over a header nobody controls.
+   *
+   * Size is still bounded: each route drops files over MAX_FILE_BYTES and
+   * refuses a request past MAX_TOTAL_UPLOAD_BYTES, both after parsing, so an
+   * oversized file skips itself instead of failing the submission.
+   */
+  fileFilter: (req, file, cb) => { cb(null, true); }
 });
 
 app.use(cors({ origin: '*' }));
@@ -1941,7 +1930,6 @@ async function ensureInspectionPdfProperty() {
         groupName: 'dealinformation',
       }),
     });
-    console.log('[update-deal-pdf] created deal property', INSPECTION_PDF_PROPERTY);
   } catch (err) {
     /*
      * 409 means another request created it between the check and this call.
