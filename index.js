@@ -2158,6 +2158,109 @@ const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 /** The adjuster fields a rep may set, and the form field each comes from. */
 const ADJUSTER_TEXT_FIELDS = ['adjuster_name', 'adjuster_phone', 'adjuster_email'];
 
+/*
+ * Stage id -> label for both roofing pipelines. Only the ops emails below read
+ * this; the dashboards carry their own copy because they render stage names on
+ * every card. Ids are unique across the two pipelines even where labels repeat.
+ */
+const STAGE_LABELS = {
+  // Roofing - Insurance
+  '4130205409': 'Site Inspection',
+  '4109489900': 'Contingency Signed',
+  '4109489901': 'Adjuster Meeting',
+  '4109489902': 'Pending Scope',
+  '4109489903': 'Scope Received/Review',
+  '4142270177': 'Contract Signed',
+  '4177282790': 'Welcome Call Ready',
+  '4109490882': 'Permits',
+  '4109489904': 'Install',
+  '4109489905': 'Supplement (if needed)',
+  '4109489906': 'Inspection',
+  '4109490883': 'Funding Complete',
+  '4109489907': 'Closed Won',
+  '4109489908': 'Closed Lost',
+  // Roofing - Retail
+  '4106670802': 'Intake',
+  '4177295046': 'Welcome Call Ready',
+  '4106670803': 'Site Inspection',
+  '4106670804': 'Design & Engineering',
+  '4106670805': 'Permitting',
+  '4106670806': 'Install',
+  '4106670807': 'Inspection',
+  '4106670808': 'Funding Complete',
+  '4106670809': 'Closed Won',
+  '4106670810': 'Closed Lost',
+};
+
+/*
+ * The dashboard sends the label it already displays, but a raw stage id is
+ * accepted too so the email never reads as a bare number to whoever opens it.
+ */
+function stageLabel(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return 'Unknown stage';
+  return STAGE_LABELS[raw] || raw;
+}
+
+const HUBSPOT_DEAL_URL = 'https://app.hubspot.com/contacts/242443515/record/0-3';
+
+/*
+ * The two request emails differ only in wording, so they share a body. Every
+ * interpolated field is rep-typed text arriving over an unauthenticated route —
+ * escaped, or a customer name containing markup renders as live HTML in Misty's
+ * and Mariah's inboxes.
+ */
+function dealRequestEmailHtml({ heading, lead, repName, customerName, address, currentStage, dealId }) {
+  const rows = [
+    ['Requested by', repName || 'Unknown rep'],
+    ['Customer', customerName || 'Unknown'],
+    ['Property address', address || '—'],
+    ['Current stage', stageLabel(currentStage)],
+  ]
+    .map(([label, value]) => `
+      <tr>
+        <td style="padding:6px 12px 6px 0;color:#6b7280;font-size:13px;vertical-align:top;white-space:nowrap">${escapeHtml(label)}</td>
+        <td style="padding:6px 0;color:#111827;font-size:13px">${escapeHtml(value)}</td>
+      </tr>`)
+    .join('');
+
+  return `
+    <div style="font-family: sans-serif; max-width: 640px; margin: 0 auto;">
+      <div style="background:#1B2A4A;padding:24px;border-radius:8px 8px 0 0">
+        <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — ${escapeHtml(heading)}</h1>
+      </div>
+      <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
+        <p style="margin:0 0 16px;color:#111827;font-size:13px;line-height:1.6">${escapeHtml(lead)}</p>
+        <table style="width:100%;border-collapse:collapse">${rows}</table>
+        <p style="margin:20px 0 0;font-size:13px">
+          <a href="${HUBSPOT_DEAL_URL}/${encodeURIComponent(dealId)}" style="color:#C9922A">Open the HubSpot deal →</a>
+        </p>
+        <p style="margin:16px 0 0;color:#6b7280;font-size:12px;line-height:1.5">
+          Sent from the rep dashboard. Nothing was changed in HubSpot — this is a request for ops to action.
+        </p>
+      </div>
+    </div>
+  `;
+}
+
+/*
+ * Wording for each request type, keyed by the action that raises it. Both are
+ * notifications only: no HubSpot call happens on either path, which is why they
+ * are handled before the deal is ever fetched.
+ */
+const DEAL_REQUESTS = {
+  lost: {
+    subjectPrefix: 'Deal Lost Request',
+    heading: 'Deal Lost Request',
+    lead: 'A rep has asked for this deal to be marked lost. Nothing has been changed in HubSpot.',
+  },
+  retail: {
+    subjectPrefix: 'Move to Retail Request',
+    heading: 'Move to Retail Request',
+    lead: 'A rep has asked for this deal to be moved to the Roofing - Retail pipeline. Nothing has been changed in HubSpot.',
+  },
+};
+
 app.post('/rep-deals/action', async (req, res) => {
   const dealId = String(req.body?.dealId || '').trim();
   const action = String(req.body?.action || '').trim();
@@ -2169,8 +2272,54 @@ app.post('/rep-deals/action', async (req, res) => {
   const rawValue = req.body?.value;
 
   if (!dealId) return res.status(400).json({ success: false, error: 'A deal id is required.' });
-  if (!['note', 'adjuster'].includes(action)) {
+  if (!['note', 'adjuster', 'lost', 'retail'].includes(action)) {
     return res.status(400).json({ success: false, error: `Unknown action "${action}".` });
+  }
+
+  /*
+   * `lost` and `retail` ask ops to do something rather than doing it — they send
+   * an email and stop. Handled here, ahead of the deal fetch below, so they make
+   * no HubSpot call at all: there is no write for the pipeline guard to protect,
+   * and a request about a deal this service may not touch is still a request ops
+   * should see.
+   */
+  if (action === 'lost' || action === 'retail') {
+    const request = DEAL_REQUESTS[action];
+    const fields = (rawValue && typeof rawValue === 'object') ? rawValue : {};
+    const customerName = String(fields.customerName || '').trim();
+    const address = String(fields.address || '').trim();
+    const currentStage = String(fields.currentStage || '').trim();
+
+    if (!repName) {
+      return res.status(400).json({ success: false, error: 'A rep name is required.' });
+    }
+
+    try {
+      await resend.emails.send({
+        from: 'NuHome Forms <noreply@thehiveoffice.com>',
+        to: ['misty@thenuhome.com', 'mariah@thenuhome.com'],
+        subject: `${request.subjectPrefix} — ${customerName || 'Unknown'}`,
+        html: dealRequestEmailHtml({
+          heading: request.heading,
+          lead: request.lead,
+          repName,
+          customerName,
+          address,
+          currentStage,
+          dealId,
+        }),
+      });
+    } catch (err) {
+      console.error(`[rep-deals] ${action} request email failed for deal`, dealId, err);
+      return res.status(500).json({
+        success: false,
+        error: 'Could not notify ops — please try again or contact them directly.',
+      });
+    }
+
+    console.log(`[rep-deals] ${action} request emailed to ops — deal`, dealId,
+      JSON.stringify(customerName), 'at', stageLabel(currentStage), 'by', repName);
+    return res.json({ success: true });
   }
 
   try {
