@@ -1049,6 +1049,39 @@ async function saveInspectionReport({ dealId, fields, damageReport, reportJson, 
   return row.id;
 }
 
+/**
+ * Maps the submitted form fields into the shape buildInspectionPDF() renders.
+ *
+ * Kept next to /inspection rather than beside the PDF code because it is the
+ * form's field names that decide it — the PDF layout should not have to know
+ * that a closer is stored as `rep`.
+ */
+function inspectionReportData(fields, damageReport, checklist) {
+  const f = fields || {};
+  return {
+    customerName: [f.fname, f.lname].filter(Boolean).join(' '),
+    propertyAddress: f.address,
+    customerPhone: f.phone,
+    customerEmail: f.customer_email,
+    closer: f.rep,
+    setter: f.setter,
+    inspectionDate: f.inspectionDate,
+    inspectedBy: f.inspector,
+    insuranceCompany: f.carrier,
+    dateOfLoss: f.stormDate,
+    numberOfSquares: f.squares,
+    roofPitch: f.pitch,
+    stories: f.stories,
+    roofAge: f.roofAge,
+    hailSize: f.hailSize,
+    severity: f.severity,
+    recommendation: f.recommendation,
+    damageAssessment: damageReport || '',
+    checklist: Array.isArray(checklist) ? checklist : [],
+    notes: f.notes || '',
+  };
+}
+
 function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes) {
   const rows = [
     ['Property address', fields.address],
@@ -1160,6 +1193,22 @@ app.post('/inspection', upload.any(), async (req, res) => {
       } catch (err) {
         console.error('[inspection] reportJson was not valid JSON:', err.message);
         notes.push('Structured report JSON was malformed and not stored');
+      }
+    }
+
+    /*
+     * Sent only so the background PDF can render its checklist section — the
+     * report row and the ops email do not use it. Malformed JSON costs that one
+     * section, not the submission.
+     */
+    let checklist = [];
+    const rawChecklist = (req.body?.checklist ?? '').toString().trim();
+    if (rawChecklist) {
+      try {
+        const parsed = JSON.parse(rawChecklist);
+        if (Array.isArray(parsed)) checklist = parsed;
+      } catch (err) {
+        console.error('[inspection] checklist was not valid JSON:', err.message);
       }
     }
 
@@ -1280,7 +1329,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
       notes.push('Ops email was not sent');
     }
 
-    return res.json({
+    res.json({
       success: true,
       dealId,
       reportId,
@@ -1289,6 +1338,27 @@ app.post('/inspection', upload.any(), async (req, res) => {
       damageReport,
       ...(notes.length ? { warnings: notes } : {}),
     });
+
+    /*
+     * Deliberately not awaited — the response has already gone out.
+     *
+     * Rendering the report means downloading every photo back from storage and
+     * drawing it, which on a large inspection takes long enough that the rep
+     * was left holding a spinner on a rooftop connection for work that changes
+     * nothing about whether the submission landed. It runs here instead, and
+     * the page polls GET /check-pdf for the result.
+     *
+     * generateAndSavePdf never throws; the .catch is a backstop so a future
+     * change to it cannot turn into an unhandled rejection that takes the
+     * process down.
+     */
+    if (dealId) {
+      generateAndSavePdf(dealId, inspectionReportData(fields, damageReport, checklist))
+        .catch(err => console.error('[inspection] background PDF generation threw:', err));
+    } else {
+      console.warn('[inspection] no deal id — skipping background PDF generation');
+    }
+    return;
 
   } catch (err) {
     console.error('[inspection] unhandled error:', err);
@@ -1795,13 +1865,82 @@ async function buildInspectionPDF(reportData, photos) {
   return { buffer, skipped };
 }
 
-/*
- * JSON in, no file upload. The photos this renders were uploaded by
- * /inspection moments earlier and are read back out of Supabase here, so the
- * rep's phone sends them exactly once.
+/**
+ * Renders the report PDF for a deal, stores it, and writes its URL onto the
+ * deal. The whole job, end to end, from a deal id and the field values.
  *
- * The same call also regenerates a report for any existing deal — ops only
- * needs the deal id and the field values, not the original photos.
+ * Never throws. It is called two ways and neither caller can act on an
+ * exception: POST /inspection fires it after the response has already gone out,
+ * and POST /generate-pdf turns the result into JSON. Failures are logged and
+ * returned, so the caller decides what they mean.
+ *
+ * Photos come from Supabase, where /inspection put them — the rep's phone
+ * uploads them exactly once.
+ */
+async function generateAndSavePdf(dealId, reportData) {
+  const warnings = [];
+  try {
+    const supabase = createSupabaseClient();
+
+    /*
+     * A storage failure must not sink the report: the fields, checklist and
+     * notes are worth having on their own, and the photos are still in the
+     * bucket for ops to pull.
+     */
+    let photos = [];
+    try {
+      const fetched = await fetchDealPhotos(supabase, dealId);
+      photos = fetched.photos;
+      warnings.push(...fetched.warnings);
+    } catch (err) {
+      console.error('[pdf] could not read photos from storage for deal', dealId, err);
+      warnings.push('Photos could not be read from storage and are not in the PDF');
+    }
+
+    console.log('[pdf] deal', dealId, '-', photos.length, 'photo(s) from storage');
+
+    const { buffer, skipped } = await buildInspectionPDF(reportData, photos);
+    if (skipped.length) warnings.push(`${skipped.length} photo(s) could not be embedded in the PDF`);
+
+    const slug = addressSlug(reportData?.propertyAddress || '');
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    const filename = `NuHome-Inspection-${slug}-${dateStamp}.pdf`;
+    const storagePath = `${dealId}/${REPORT_PDF_CATEGORY}/${filename}`;
+
+    const { error } = await supabase.storage.from(PHOTO_BUCKET).upload(storagePath, buffer, {
+      contentType: 'application/pdf',
+      upsert: true,
+    });
+    if (error) throw new Error(`Supabase upload failed: ${error.message}`);
+
+    const pdfUrl =
+      `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${storagePath}`;
+
+    /*
+     * Separate from the render: the PDF is already stored and downloadable at
+     * this point, so a HubSpot failure is a warning, not a failed generation.
+     * It does cost the rep the download button — GET /check-pdf reads this
+     * property, so a URL that never lands there is a PDF they cannot see.
+     */
+    try {
+      await writeInspectionPdfUrl(dealId, pdfUrl);
+    } catch (err) {
+      console.error('[pdf] could not write', INSPECTION_PDF_PROPERTY, 'for deal', dealId, err);
+      warnings.push('PDF URL was not written to the deal');
+    }
+
+    console.log('[pdf] wrote', storagePath, buffer.length, 'bytes for deal', dealId);
+    return { success: true, pdfUrl, warnings };
+  } catch (err) {
+    console.error('[pdf] generation failed for deal', dealId, err);
+    return { success: false, error: err.message || 'PDF generation failed.', warnings };
+  }
+}
+
+/*
+ * Manual regeneration, for ops. The submission path no longer calls this —
+ * /inspection kicks the same work off in the background — but a report can
+ * still be rebuilt for any existing deal from its id and field values.
  */
 app.post('/generate-pdf', async (req, res) => {
   try {
@@ -1834,49 +1973,17 @@ app.post('/generate-pdf', async (req, res) => {
       return res.status(400).json({ success: false, error: 'reportData must be a JSON object.' });
     }
 
-    const supabase = createSupabaseClient();
-
-    /*
-     * A storage failure must not sink the report: the fields, checklist and
-     * notes are worth having on their own, and the photos are still in the
-     * bucket for ops to pull.
-     */
-    let photos = [];
-    const warnings = [];
-    try {
-      const fetched = await fetchDealPhotos(supabase, dealId);
-      photos = fetched.photos;
-      warnings.push(...fetched.warnings);
-    } catch (err) {
-      console.error('[generate-pdf] could not read photos from storage:', err);
-      warnings.push('Photos could not be read from storage and are not in the PDF');
+    const result = await generateAndSavePdf(dealId, reportData);
+    if (!result.success) {
+      return res.status(500).json({ success: false, error: result.error });
     }
-
-    console.log('[generate-pdf] deal', dealId, '-', photos.length, 'photo(s) from storage');
-
-    const { buffer, skipped } = await buildInspectionPDF(reportData, photos);
-
-    const slug = addressSlug(reportData.propertyAddress || '');
-    const dateStamp = new Date().toISOString().slice(0, 10);
-    const filename = `NuHome-Inspection-${slug}-${dateStamp}.pdf`;
-    const storagePath = `${dealId}/${REPORT_PDF_CATEGORY}/${filename}`;
-
-    const { error } = await supabase.storage.from(PHOTO_BUCKET).upload(storagePath, buffer, {
-      contentType: 'application/pdf',
-      upsert: true,
+    return res.json({
+      success: true,
+      pdfUrl: result.pdfUrl,
+      ...(result.warnings.length ? { warnings: result.warnings } : {}),
     });
-    if (error) throw new Error(`Supabase upload failed: ${error.message}`);
-
-    const pdfUrl =
-      `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${storagePath}`;
-
-    if (skipped.length) warnings.push(`${skipped.length} photo(s) could not be embedded in the PDF`);
-
-    console.log('[generate-pdf] wrote', storagePath, buffer.length, 'bytes');
-    return res.json({ success: true, pdfUrl, ...(warnings.length ? { warnings } : {}) });
   } catch (err) {
-    // Never a bare 500 or a crash — the frontend treats a failed PDF as a
-    // warning on an otherwise successful submission, and needs JSON to do it.
+    // Never a bare 500 or a crash — callers always get JSON they can render.
     console.error('[generate-pdf] failed:', err);
     return res.status(500).json({ success: false, error: err.message || 'PDF generation failed.' });
   }
@@ -1941,6 +2048,37 @@ async function ensureInspectionPdfProperty() {
   inspectionPdfPropertyReady = true;
 }
 
+/**
+ * Writes the PDF URL onto the deal. Shared by generateAndSavePdf() and the
+ * PATCH route below, so both go through the same pipeline guard.
+ *
+ * Throws on failure — both callers want to know, and both handle it.
+ */
+async function writeInspectionPdfUrl(dealId, pdfUrl) {
+  /*
+   * Unlike most deal writes in this service, the id can come from the caller
+   * rather than from a deal this service just created — so the pipeline is read
+   * off the deal and checked, instead of asserting against a constant. That is
+   * what actually keeps Ops/Install out of reach: a deal in FORBIDDEN_PIPELINE
+   * is refused before any write is attempted.
+   */
+  const deal = await hubspot(
+    `/crm/v3/objects/deals/${encodeURIComponent(dealId)}?properties=pipeline`
+  );
+  assertPipelineAllowed(deal?.properties?.pipeline);
+
+  // Before the write, so a missing property is created rather than surfacing
+  // as HubSpot rejecting the whole PATCH.
+  await ensureInspectionPdfProperty();
+
+  await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties: { [INSPECTION_PDF_PROPERTY]: pdfUrl } }),
+  });
+
+  console.log('[update-deal-pdf] wrote', INSPECTION_PDF_PROPERTY, 'for deal', dealId);
+}
+
 app.patch('/update-deal-pdf', async (req, res) => {
   try {
     const dealId = (req.body?.dealId ?? '').toString().trim();
@@ -1949,32 +2087,37 @@ app.patch('/update-deal-pdf', async (req, res) => {
     if (!dealId) return res.status(400).json({ success: false, error: 'dealId is required.' });
     if (!pdfUrl) return res.status(400).json({ success: false, error: 'pdfUrl is required.' });
 
-    /*
-     * Unlike every other deal write in this service, the id here comes from the
-     * caller rather than from a deal this service just created — so the
-     * pipeline is read off the deal and checked, instead of asserting against a
-     * constant. That is what actually keeps Ops/Install out of reach: a deal in
-     * FORBIDDEN_PIPELINE is refused before any write is attempted.
-     */
-    const deal = await hubspot(
-      `/crm/v3/objects/deals/${encodeURIComponent(dealId)}?properties=pipeline`
-    );
-    assertPipelineAllowed(deal?.properties?.pipeline);
-
-    // Before the write, so a missing property is created rather than surfacing
-    // as HubSpot rejecting the whole PATCH.
-    await ensureInspectionPdfProperty();
-
-    await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ properties: { [INSPECTION_PDF_PROPERTY]: pdfUrl } }),
-    });
-
-    console.log('[update-deal-pdf] wrote', INSPECTION_PDF_PROPERTY, 'for deal', dealId);
+    await writeInspectionPdfUrl(dealId, pdfUrl);
     return res.json({ success: true });
   } catch (err) {
     console.error('[update-deal-pdf] failed:', err);
     return res.status(500).json({ success: false, error: err.message || 'Could not update the deal.' });
+  }
+});
+
+/*
+ * Polled by the rep's page while the background PDF renders. The submission
+ * itself returned long ago; this is the one thing still outstanding.
+ *
+ * Every failure answers { ready: false } with a 200. The caller is a poller on
+ * a five-minute budget, and "keep waiting" is the right response to a blip —
+ * a 500 would only make the page treat a recoverable hiccup as a dead end. The
+ * real error still goes to the log.
+ */
+app.get('/check-pdf', async (req, res) => {
+  const dealId = (req.query?.dealId ?? '').toString().trim();
+  if (!dealId) return res.status(400).json({ ready: false, error: 'dealId is required.' });
+
+  try {
+    const deal = await hubspot(
+      `/crm/v3/objects/deals/${encodeURIComponent(dealId)}?properties=${INSPECTION_PDF_PROPERTY}`
+    );
+    const pdfUrl = (deal?.properties?.[INSPECTION_PDF_PROPERTY] || '').toString().trim();
+    if (!pdfUrl) return res.json({ ready: false });
+    return res.json({ ready: true, pdfUrl });
+  } catch (err) {
+    console.error('[check-pdf] lookup failed for deal', dealId, err);
+    return res.json({ ready: false });
   }
 });
 
