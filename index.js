@@ -956,25 +956,51 @@ async function uploadPhotos(dealId, photos) {
   const uploaded = [];
   const failed = [];
 
-  for (const photo of photos) {
+  /*
+   * All at once rather than one after another. Every buffer is already in
+   * memory, so the sequential loop this replaces was spending the submission's
+   * longest stretch waiting on round-trips it could have overlapped — and the
+   * rep is holding the page open for all of it.
+   */
+  const results = await Promise.all(photos.map(async (photo) => {
     console.log('Uploading photo:', photo.fieldname, photo.originalname, photo.buffer?.length, 'bytes');
     const safeName = String(photo.originalname || 'photo.jpg').replace(/[^\w.\-]/g, '_');
     const path = `${dealId}/${photo.category}/${safeName}`;
-    const { data, error } = await supabase.storage.from(PHOTO_BUCKET).upload(path, photo.buffer, {
-      contentType: photo.mimetype,
-      upsert: true,
-    });
-    console.log('Supabase upload result for', path, '- data:', data, '- error:', error);
-    if (error) failed.push(`${path}: ${error.message}`);
-    /*
-     * safeName has already stripped everything outside [\w.-], and dealId and
-     * category are machine-generated, so the path needs no URL encoding.
-     */
-    else uploaded.push({
-      path,
-      category: photo.category,
-      url: `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${path}`,
-    });
+    try {
+      const { data, error } = await supabase.storage.from(PHOTO_BUCKET).upload(path, photo.buffer, {
+        contentType: photo.mimetype,
+        upsert: true,
+      });
+      console.log('Supabase upload result for', path, '- data:', data, '- error:', error);
+      if (error) return { success: false, path, error: error.message };
+      /*
+       * safeName has already stripped everything outside [\w.-], and dealId and
+       * category are machine-generated, so the path needs no URL encoding.
+       */
+      return {
+        success: true,
+        path,
+        category: photo.category,
+        url: `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${path}`,
+      };
+    } catch (err) {
+      /*
+       * Caught per photo rather than left to reject. Promise.all rejects on the
+       * first throw and abandons its siblings, so one photo that threw instead
+       * of returning an { error } result would discard every upload beside it —
+       * the exact opposite of the soft-skip this function is built around.
+       */
+      return { success: false, path, error: err.message || String(err) };
+    }
+  }));
+
+  // Promise.all preserves input order, so uploaded[] still matches photos[].
+  for (const result of results) {
+    if (result.success) {
+      uploaded.push({ path: result.path, category: result.category, url: result.url });
+    } else {
+      failed.push(`${result.path}: ${result.error}`);
+    }
   }
 
   // Zip failures must not discard the individual uploads that already
