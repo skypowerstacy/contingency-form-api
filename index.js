@@ -1,5 +1,22 @@
+/*
+ * Environment variables — all set in the Railway service, none have defaults:
+ *
+ *   HUBSPOT_PRIVATE_APP_TOKEN  HubSpot private app token. Every CRM read/write.
+ *   RESEND_API_KEY             Transactional email to ops.
+ *   SUPABASE_URL               Supabase project URL (file storage, report rows).
+ *   SUPABASE_SERVICE_ROLE_KEY  Supabase service-role key.
+ *   ANTHROPIC_API_KEY          Backs POST /report, the damage-report generator.
+ *   ADMIN_TOKEN                Shared secret for GET /admin-deals, sent by
+ *                              public/admin-dashboard.html as the x-admin-token
+ *                              header. MUST BE SET IN RAILWAY before the admin
+ *                              dashboard will load — until it is, /admin-deals
+ *                              refuses every request with 401 rather than
+ *                              falling open.
+ *   PORT                       Supplied by Railway.
+ */
 const express = require('express');
 const multer = require('multer');
+const crypto = require('crypto');
 const { Resend } = require('resend');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -1967,55 +1984,51 @@ app.get('/report/:reportId', async (req, res) => {
 // ===========================================================================
 
 /*
- * How far a rep may push a deal on their own, per pipeline.
- *
- * `sequence` is the rep-facing path through the pipeline and `limit` is the
- * last stage they may land on — everything after it belongs to ops and is
- * refused here rather than hidden in the UI, so a hand-made request cannot
- * reach it either.
- *
- * Retail's sequence is a single stage: Intake is both the start and the limit,
- * so retail deals never advance from this dashboard at all.
+ * The adjuster name/phone/email trio is fetched alongside the required set so
+ * the rep dashboard's adjuster form opens pre-filled with whatever is already
+ * on the deal, rather than looking blank and inviting a re-type.
  */
-const REP_STAGE_FLOW = {
-  [INSPECTION_PIPELINE]: {
-    sequence: [
-      '4130205409', // Site Inspection
-      '4109489900', // Contingency Signed
-      '4109489901', // Adjuster Meeting
-      '4109489902', // Pending Scope
-      '4109489903', // Scope Received/Review
-      '4142270177', // Contract Signed — the last stage a rep may set
-    ],
-    limit: '4142270177',
-  },
-  [RETAIL_PIPELINE]: {
-    sequence: ['4106670802'], // Intake — start and limit both
-    limit: '4106670802',
-  },
-};
-
 const REP_DEAL_PROPERTIES = [
   'hs_object_id', 'dealname', 'customers_full_address', 'dealstage', 'pipeline',
   'hs_lastmodifieddate', 'adjuster_meeting_date', 'closer', 'setter', 'amount',
+  'adjuster_name', 'adjuster_phone', 'adjuster_email',
 ];
 
-const STAGE_LOCKED_MESSAGE = 'Stage advancement not permitted beyond this point. Please contact ops.';
-
-/**
- * The stage a rep may move this deal to, or null when the deal is at or past
- * the rep limit — including any stage outside the rep sequence entirely, which
- * means ops has already taken it further than this dashboard reaches.
+/*
+ * Stage ids this service reasons about by name.
+ *
+ * Reps no longer move deals through a sequence — the only stage change they can
+ * cause is the one below, and it happens as a side effect of logging the
+ * adjuster appointment rather than as a step they choose. Everything else is
+ * ops-owned and unreachable from here.
  */
-function nextRepStage(pipelineId, currentStage) {
-  const flow = REP_STAGE_FLOW[String(pipelineId)];
-  if (!flow) return null;
+const CONTINGENCY_SIGNED_STAGE_ID = '4109489900';
+const ADJUSTER_MEETING_STAGE_ID = '4109489901';
 
-  const index = flow.sequence.indexOf(String(currentStage));
-  const limitIndex = flow.sequence.indexOf(flow.limit);
-  if (index < 0 || index >= limitIndex) return null;
+// Closed Won / Closed Lost in both roofing pipelines. "Open" means none of these.
+const CLOSED_STAGE_IDS = [
+  '4109489907', '4109489908', // Roofing - Insurance
+  '4106670809', '4106670810', // Roofing - Retail
+];
 
-  return flow.sequence[index + 1] || null;
+/** The common shape both dashboards render a deal from. */
+function mapDealRow(row) {
+  const p = row.properties || {};
+  return {
+    dealId: String(p.hs_object_id || row.id),
+    dealname: p.dealname || '',
+    address: p.customers_full_address || '',
+    dealstage: String(p.dealstage || ''),
+    pipeline: String(p.pipeline || ''),
+    lastModified: p.hs_lastmodifieddate || null,
+    adjusterMeetingDate: p.adjuster_meeting_date || null,
+    adjusterName: p.adjuster_name || null,
+    adjusterPhone: p.adjuster_phone || null,
+    adjusterEmail: p.adjuster_email || null,
+    closer: p.closer || null,
+    setter: p.setter || null,
+    amount: p.amount || null,
+  };
 }
 
 /**
@@ -2107,19 +2120,9 @@ app.get('/rep-deals', async (req, res) => {
       const isSetter = !!identities.setter && p.setter === identities.setter;
 
       const deal = {
-        dealId: String(p.hs_object_id || row.id),
-        dealname: p.dealname || '',
-        address: p.customers_full_address || '',
-        dealstage: String(p.dealstage || ''),
-        pipeline,
-        lastModified: p.hs_lastmodifieddate || null,
-        adjusterMeetingDate: p.adjuster_meeting_date || null,
-        closer: p.closer || null,
-        setter: p.setter || null,
-        amount: p.amount || null,
-        role: isCloser && isSetter ? 'BOTH' : isCloser ? 'CLOSER' : 'SETTER',
-        // Sent so the card does not have to re-derive the rep limit client-side.
-        nextStage: nextRepStage(pipeline, p.dealstage),
+        ...mapDealRow(row),
+        // A rep who both set and closed the deal generated it themselves.
+        role: isCloser && isSetter ? 'SELF GEN' : isCloser ? 'CLOSER' : 'SETTER',
       };
 
       (pipeline === INSPECTION_PIPELINE ? insurance : retail).push(deal);
@@ -2152,14 +2155,21 @@ const NOTE_TO_DEAL_ASSOCIATION_TYPE_ID = 214;
 /** YYYY-MM-DD, which is what HubSpot accepts for a `date` property. */
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
+/** The adjuster fields a rep may set, and the form field each comes from. */
+const ADJUSTER_TEXT_FIELDS = ['adjuster_name', 'adjuster_phone', 'adjuster_email'];
+
 app.post('/rep-deals/action', async (req, res) => {
   const dealId = String(req.body?.dealId || '').trim();
   const action = String(req.body?.action || '').trim();
-  const value = req.body?.value == null ? '' : String(req.body.value).trim();
   const repName = String(req.body?.repName || '').trim();
+  /*
+   * `value` is a string for a note and an object for the adjuster form, so it is
+   * kept raw here and read in the shape each branch expects.
+   */
+  const rawValue = req.body?.value;
 
   if (!dealId) return res.status(400).json({ success: false, error: 'A deal id is required.' });
-  if (!['note', 'advance', 'date'].includes(action)) {
+  if (!['note', 'adjuster'].includes(action)) {
     return res.status(400).json({ success: false, error: `Unknown action "${action}".` });
   }
 
@@ -2175,6 +2185,7 @@ app.post('/rep-deals/action', async (req, res) => {
     assertPipelineAllowed(pipeline);
 
     if (action === 'note') {
+      const value = String(rawValue == null ? '' : rawValue).trim();
       if (!value) return res.status(400).json({ success: false, error: 'The note is empty.' });
 
       // Attributed in the body: notes created by a private app carry no author,
@@ -2199,53 +2210,160 @@ app.post('/rep-deals/action', async (req, res) => {
       return res.json({ success: true });
     }
 
-    if (action === 'advance') {
-      /*
-       * The live stage is the source of truth, not the one the card sent. A
-       * dashboard left open while ops moved the deal would otherwise advance
-       * from a stage the deal has already left.
-       */
-      if (value && value !== currentStage) {
-        return res.json({
-          success: false,
-          error: 'This deal has moved since the page was loaded. Tap Refresh and try again.',
-        });
-      }
+    // action === 'adjuster'
+    const fields = (rawValue && typeof rawValue === 'object') ? rawValue : {};
+    const properties = {};
 
-      const nextStage = nextRepStage(pipeline, currentStage);
-      if (!nextStage) {
-        console.log('[rep-deals] refused advance past rep limit — deal', dealId, 'stage', currentStage);
-        return res.json({ success: false, error: STAGE_LOCKED_MESSAGE });
-      }
-
-      // Re-asserted immediately before the write, so the guard sits on the same
-      // side of every early return above it.
-      assertPipelineAllowed(pipeline);
-      await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ properties: { dealstage: nextStage } }),
-      });
-
-      console.log('[rep-deals] deal', dealId, 'advanced', currentStage, '->', nextStage, 'by', repName || 'unknown rep');
-      return res.json({ success: true, dealstage: nextStage, nextStage: nextRepStage(pipeline, nextStage) });
+    for (const key of ADJUSTER_TEXT_FIELDS) {
+      const entry = String(fields[key] == null ? '' : fields[key]).trim();
+      // Absent and empty are the same thing: leave whatever HubSpot already
+      // holds rather than blanking a field the rep simply did not retype.
+      if (entry) properties[key] = entry;
     }
 
-    // action === 'date'
-    if (!ISO_DATE_PATTERN.test(value)) {
-      return res.status(400).json({ success: false, error: 'A date in YYYY-MM-DD format is required.' });
+    const meetingDate = String(fields.adjuster_meeting_date == null ? '' : fields.adjuster_meeting_date).trim();
+    if (meetingDate) {
+      if (!ISO_DATE_PATTERN.test(meetingDate)) {
+        return res.status(400).json({ success: false, error: 'The meeting date must be in YYYY-MM-DD format.' });
+      }
+      properties.adjuster_meeting_date = meetingDate;
     }
 
+    if (!Object.keys(properties).length) {
+      return res.status(400).json({ success: false, error: 'Fill in at least one adjuster field.' });
+    }
+
+    /*
+     * Logging the appointment is what moves the deal, and only from the one
+     * stage where that transition makes sense. A deal already at Adjuster
+     * Meeting or beyond keeps its stage and just takes the field update, so
+     * correcting a phone number later cannot drag a deal backwards or forwards.
+     */
+    const advancing = !!meetingDate
+      && pipeline === INSPECTION_PIPELINE
+      && currentStage === CONTINGENCY_SIGNED_STAGE_ID;
+    if (advancing) properties.dealstage = ADJUSTER_MEETING_STAGE_ID;
+
+    // Re-asserted immediately before the write, so the guard sits on the same
+    // side of every early return above it.
     assertPipelineAllowed(pipeline);
     await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
       method: 'PATCH',
-      body: JSON.stringify({ properties: { adjuster_meeting_date: value } }),
+      body: JSON.stringify({ properties }),
     });
 
-    console.log('[rep-deals] adjuster meeting date set on deal', dealId, 'to', value, 'by', repName || 'unknown rep');
-    return res.json({ success: true, adjusterMeetingDate: value });
+    console.log('[rep-deals] adjuster info saved on deal', dealId,
+      '-', Object.keys(properties).join(', '),
+      advancing ? `(advanced ${currentStage} -> ${ADJUSTER_MEETING_STAGE_ID})` : '(stage unchanged)',
+      'by', repName || 'unknown rep');
+
+    return res.json({
+      success: true,
+      dealstage: advancing ? ADJUSTER_MEETING_STAGE_ID : currentStage,
+      advanced: advancing,
+      adjusterName: properties.adjuster_name || null,
+      adjusterPhone: properties.adjuster_phone || null,
+      adjusterEmail: properties.adjuster_email || null,
+      adjusterMeetingDate: properties.adjuster_meeting_date || null,
+    });
   } catch (err) {
     console.error('[rep-deals] action failed:', action, 'deal', dealId, err);
     return res.status(500).json({ success: false, error: 'Could not update the deal in HubSpot.' });
+  }
+});
+
+// ===========================================================================
+// /admin-deals — every open roofing deal, for public/admin-dashboard.html
+//
+// The one authenticated route in this service. ADMIN_TOKEN must be set in
+// Railway; while it is unset this refuses everything rather than falling open.
+// ===========================================================================
+
+/**
+ * Constant-time string comparison, so a wrong token cannot be narrowed down by
+ * timing the response. Length is compared first and does leak, which is the
+ * standard trade — a token's length is not the secret.
+ */
+function tokensMatch(supplied, expected) {
+  const a = Buffer.from(String(supplied || ''), 'utf8');
+  const b = Buffer.from(String(expected || ''), 'utf8');
+  if (a.length === 0 || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function adminAuthorised(req) {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected) {
+    // Refusing here is the whole point: an unset variable would otherwise make
+    // `undefined === undefined` a valid credential and open the route to anyone.
+    console.error('[admin-deals] ADMIN_TOKEN is not set — refusing every request.');
+    return false;
+  }
+  return tokensMatch(req.get('x-admin-token'), expected);
+}
+
+/** Walks every page of open deals across both roofing pipelines. */
+async function searchOpenRoofingDeals() {
+  const filterGroups = [{
+    filters: [
+      { propertyName: 'pipeline', operator: 'IN', values: [INSPECTION_PIPELINE, RETAIL_PIPELINE] },
+      { propertyName: 'dealstage', operator: 'NOT_IN', values: CLOSED_STAGE_IDS },
+    ],
+  }];
+
+  const collected = [];
+  let after;
+  // 50 pages is 5,000 deals — well past both roofing pipelines combined, and a
+  // bound so a cursor that never terminates cannot spin the request forever.
+  for (let page = 0; page < 50; page += 1) {
+    const search = await hubspot('/crm/v3/objects/deals/search', {
+      method: 'POST',
+      body: JSON.stringify({
+        filterGroups,
+        properties: REP_DEAL_PROPERTIES,
+        sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'DESCENDING' }],
+        limit: 100,
+        ...(after ? { after } : {}),
+      }),
+    });
+    collected.push(...(search?.results || []));
+    after = search?.paging?.next?.after;
+    if (!after) break;
+  }
+  return collected;
+}
+
+app.get('/admin-deals', async (req, res) => {
+  if (!adminAuthorised(req)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const rows = await searchOpenRoofingDeals();
+
+    const insurance = [];
+    const retail = [];
+    const summary = { insurance: {}, retail: {} };
+
+    for (const row of rows) {
+      const deal = mapDealRow(row);
+
+      // Structurally guaranteed by the search filter; re-checked because this is
+      // where deal data leaves the service.
+      if (deal.pipeline !== INSPECTION_PIPELINE && deal.pipeline !== RETAIL_PIPELINE) continue;
+
+      const isInsurance = deal.pipeline === INSPECTION_PIPELINE;
+      (isInsurance ? insurance : retail).push(deal);
+
+      const bucket = isInsurance ? summary.insurance : summary.retail;
+      bucket[deal.dealstage] = (bucket[deal.dealstage] || 0) + 1;
+    }
+
+    console.log('[admin-deals] open deals — insurance:', insurance.length, 'retail:', retail.length);
+    return res.json({ success: true, insurance, retail, summary });
+  } catch (err) {
+    console.error('[admin-deals] lookup failed:', err);
+    return res.status(500).json({ success: false, error: 'Could not load deals from HubSpot.' });
   }
 });
 
