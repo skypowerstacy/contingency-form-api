@@ -766,7 +766,12 @@ async function hubspot(path, options = {}) {
 
   if (!res.ok) {
     const detail = body?.message || text || res.statusText;
-    throw new Error(`HubSpot ${options.method || 'GET'} ${path} failed (${res.status}): ${detail}`);
+    const err = new Error(`HubSpot ${options.method || 'GET'} ${path} failed (${res.status}): ${detail}`);
+    // Carried so callers can separate "this does not exist yet" from a real
+    // failure — ensureInspectionPdfProperty() creates on 404 and rethrows the
+    // rest rather than papering over an auth or rate-limit error.
+    err.status = res.status;
+    throw err;
   }
   return body;
 }
@@ -1344,11 +1349,117 @@ const PDF_PHOTO_CATEGORIES = [
   { key: 'gutters', label: 'Gutters & Accessories' },
 ];
 
+/*
+ * Photos are read back out of Supabase rather than re-uploaded by the browser.
+ * POST /inspection has already put them in {dealId}/{category}/, so asking the
+ * phone to send the same 30-50MB a second time only doubles the slowest, most
+ * failure-prone leg of the submission — over a roof-top connection that is
+ * where the flow actually breaks.
+ */
+
+// Bounds the memory one request can pull in. Files over the per-file cap were
+// never uploaded by /inspection, so only the total needs a guard here.
+const PDF_MAX_PHOTO_BYTES = MAX_TOTAL_UPLOAD_BYTES;
+const PDF_MAX_PHOTOS = 120;
+
+/** Supabase returns folders as entries with a null id; real files carry one. */
+function isStorageFolder(entry) {
+  return !!entry && entry.id == null;
+}
+
+/**
+ * Lists and downloads every inspection photo filed under {dealId}/.
+ *
+ * Skips the report/ subfolder (that is this endpoint's own output — embedding
+ * the previous PDF into the new one would compound on every regeneration) and
+ * any .zip (the photo archive, which holds a second copy of every photo).
+ *
+ * Returns { photos, warnings }. A download that fails is dropped with a
+ * warning: a report missing one photo is worth far more to ops than no report.
+ */
+async function fetchDealPhotos(supabase, dealId) {
+  const warnings = [];
+  const photos = [];
+
+  const { data: top, error: topError } = await supabase.storage
+    .from(PHOTO_BUCKET).list(dealId, { limit: 1000 });
+  if (topError) throw new Error(`Could not list photos for deal ${dealId}: ${topError.message}`);
+
+  const categories = (top || [])
+    .filter(isStorageFolder)
+    .map(entry => entry.name)
+    .filter(name => name && name !== REPORT_PDF_CATEGORY);
+
+  let totalBytes = 0;
+
+  for (const category of categories) {
+    const prefix = `${dealId}/${category}`;
+    const { data: files, error } = await supabase.storage
+      .from(PHOTO_BUCKET).list(prefix, { limit: 1000 });
+    if (error) {
+      warnings.push(`Could not list ${category} photos`);
+      console.error('[generate-pdf] list failed for', prefix, error.message);
+      continue;
+    }
+
+    // Stable ordering, so regenerating a report lays the photos out identically.
+    const names = (files || [])
+      .filter(entry => !isStorageFolder(entry))
+      .map(entry => entry.name)
+      .filter(name => name && !/\.zip$/i.test(name))
+      .sort();
+
+    for (const name of names) {
+      if (photos.length >= PDF_MAX_PHOTOS) {
+        warnings.push(`Only the first ${PDF_MAX_PHOTOS} photos were included in the PDF`);
+        return { photos, warnings };
+      }
+
+      const objectPath = `${prefix}/${name}`;
+      const { data: blob, error: downloadError } = await supabase.storage
+        .from(PHOTO_BUCKET).download(objectPath);
+      if (downloadError || !blob) {
+        warnings.push(`Could not download ${name}`);
+        console.error('[generate-pdf] download failed for', objectPath, downloadError && downloadError.message);
+        continue;
+      }
+
+      const buffer = Buffer.from(await blob.arrayBuffer());
+      totalBytes += buffer.length;
+      if (totalBytes > PDF_MAX_PHOTO_BYTES) {
+        warnings.push('Photo set was too large to embed in full');
+        console.warn('[generate-pdf] photo budget exhausted at', totalBytes, 'bytes');
+        return { photos, warnings };
+      }
+
+      photos.push({ buffer, originalname: name, category: category.toLowerCase() });
+    }
+  }
+
+  return { photos, warnings };
+}
+
 /** Title-cases an unrecognised category key so it still gets a real heading. */
 function photoCategoryLabel(key) {
   const known = PDF_PHOTO_CATEGORIES.find(c => c.key === key);
   if (known) return known.label;
   return String(key || 'Photos').replace(/[-_]+/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
+}
+
+/*
+ * Reads one report field under either spelling.
+ *
+ * The frontend sends camelCase, matching the keys reportData already uses
+ * (customerName, propertyAddress). The snake_case names are the matching
+ * HubSpot deal properties, accepted so anything that copies deal properties
+ * straight into reportData still renders.
+ */
+function pdfField(d, camelKey, snakeKey) {
+  const source = d || {};
+  const value = (source[camelKey] == null || source[camelKey] === '')
+    ? source[snakeKey]
+    : source[camelKey];
+  return value == null ? '' : String(value).trim();
 }
 
 /** Collects a finished PDFDocument into a single Buffer. */
@@ -1476,6 +1587,11 @@ async function buildInspectionPDF(reportData, photos) {
     doc.y = y + rowH;
   };
 
+  /** Same row, but a blank value prints nothing at all rather than an em dash. */
+  const optionalRow = (label, value) => {
+    if (value) fieldRow(label, value);
+  };
+
   const paragraph = text => {
     const body = String(text == null ? '' : text);
     if (!body.trim()) return;
@@ -1508,6 +1624,20 @@ async function buildInspectionPDF(reportData, photos) {
   fieldRow('Inspected By', d.inspectedBy);
   fieldRow('Closer', d.closer);
   fieldRow('Setter', d.setter);
+
+  /*
+   * Claim and roof details. Shown only when supplied — a report for a property
+   * with no storm date should not carry an empty "Date of Loss" row.
+   */
+  optionalRow('Insurance Carrier', pdfField(d, 'insuranceCompany', 'insurance_company'));
+  optionalRow('Date of Loss', pdfField(d, 'dateOfLoss', 'date_of_loss'));
+  optionalRow('Number of Squares', pdfField(d, 'numberOfSquares', 'number_of_squares'));
+  optionalRow('Roof Pitch', pdfField(d, 'roofPitch', 'roof_pitch'));
+  optionalRow('Stories', pdfField(d, 'stories', 'stories'));
+  optionalRow('Roof Age', pdfField(d, 'roofAge', 'roof_age'));
+  optionalRow('Hail Size', pdfField(d, 'hailSize', 'hail_size'));
+  optionalRow('Severity', pdfField(d, 'severity', 'severity'));
+  optionalRow('Recommendation', pdfField(d, 'recommendation', 'recommendation'));
 
   // ---- Damage assessment ----
   const assessment = String(d.damageAssessment || '').trim();
@@ -1676,49 +1806,64 @@ async function buildInspectionPDF(reportData, photos) {
   return { buffer, skipped };
 }
 
-app.post('/generate-pdf', upload.any(), async (req, res) => {
+/*
+ * JSON in, no file upload. The photos this renders were uploaded by
+ * /inspection moments earlier and are read back out of Supabase here, so the
+ * rep's phone sends them exactly once.
+ *
+ * The same call also regenerates a report for any existing deal — ops only
+ * needs the deal id and the field values, not the original photos.
+ */
+app.post('/generate-pdf', async (req, res) => {
   try {
-    // Same soft-skip as /inspection: an oversized file drops out and the rest
-    // of the report is still produced.
-    const oversized = (req.files || []).filter(f => f.size > MAX_FILE_BYTES);
-    const acceptedFiles = (req.files || []).filter(f => f.size <= MAX_FILE_BYTES);
-    if (oversized.length) {
-      console.warn('[generate-pdf] skipped oversized files:',
-        oversized.map(f => `${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
-    }
-
     const rawDealId = (req.body?.dealId ?? '').toString().trim();
     // The id becomes a storage path segment, so anything outside [\w.-] would
-    // let a caller write outside the deal's own folder.
+    // let a caller read or write outside the deal's own folder.
     const dealId = rawDealId.replace(/[^\w.-]/g, '');
     if (!dealId) {
       return res.status(400).json({ success: false, error: 'dealId is required.' });
     }
 
-    const rawReportData = (req.body?.reportData ?? '').toString().trim();
-    if (!rawReportData) {
+    /*
+     * Accepts the parsed object or the JSON string form of it — the documented
+     * contract is a string, but the browser has a JSON body already and
+     * double-encoding it buys nothing.
+     */
+    const rawReportData = req.body?.reportData;
+    if (rawReportData == null || rawReportData === '') {
       return res.status(400).json({ success: false, error: 'reportData is required.' });
     }
-    let reportData;
-    try {
-      reportData = JSON.parse(rawReportData);
-    } catch (err) {
-      return res.status(400).json({ success: false, error: 'reportData was not valid JSON.' });
+    let reportData = rawReportData;
+    if (typeof rawReportData === 'string') {
+      try {
+        reportData = JSON.parse(rawReportData);
+      } catch (err) {
+        return res.status(400).json({ success: false, error: 'reportData was not valid JSON.' });
+      }
     }
-    if (!reportData || typeof reportData !== 'object') {
+    if (!reportData || typeof reportData !== 'object' || Array.isArray(reportData)) {
       return res.status(400).json({ success: false, error: 'reportData must be a JSON object.' });
     }
 
-    // Same fieldname convention as /inspection — photos_<category>[] — so the
-    // report can group them. A bare photos_report[] lands in 'report'.
-    const photos = acceptedFiles
-      .map(file => {
-        const match = /^photos_([a-z]+)(\[\])?$/i.exec(file.fieldname);
-        return match ? { ...file, category: match[1].toLowerCase() } : null;
-      })
-      .filter(Boolean);
+    const supabase = createSupabaseClient();
 
-    console.log('[generate-pdf] deal', dealId, '-', photos.length, 'photo(s)');
+    /*
+     * A storage failure must not sink the report: the fields, checklist and
+     * notes are worth having on their own, and the photos are still in the
+     * bucket for ops to pull.
+     */
+    let photos = [];
+    const warnings = [];
+    try {
+      const fetched = await fetchDealPhotos(supabase, dealId);
+      photos = fetched.photos;
+      warnings.push(...fetched.warnings);
+    } catch (err) {
+      console.error('[generate-pdf] could not read photos from storage:', err);
+      warnings.push('Photos could not be read from storage and are not in the PDF');
+    }
+
+    console.log('[generate-pdf] deal', dealId, '-', photos.length, 'photo(s) from storage');
 
     const { buffer, skipped } = await buildInspectionPDF(reportData, photos);
 
@@ -1727,7 +1872,6 @@ app.post('/generate-pdf', upload.any(), async (req, res) => {
     const filename = `NuHome-Inspection-${slug}-${dateStamp}.pdf`;
     const storagePath = `${dealId}/${REPORT_PDF_CATEGORY}/${filename}`;
 
-    const supabase = createSupabaseClient();
     const { error } = await supabase.storage.from(PHOTO_BUCKET).upload(storagePath, buffer, {
       contentType: 'application/pdf',
       upsert: true,
@@ -1737,8 +1881,6 @@ app.post('/generate-pdf', upload.any(), async (req, res) => {
     const pdfUrl =
       `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${PHOTO_BUCKET}/${storagePath}`;
 
-    const warnings = [];
-    if (oversized.length) warnings.push(`${oversized.length} photo(s) over 25MB were not included in the PDF`);
     if (skipped.length) warnings.push(`${skipped.length} photo(s) could not be embedded in the PDF`);
 
     console.log('[generate-pdf] wrote', storagePath, buffer.length, 'bytes');
@@ -1758,6 +1900,58 @@ app.post('/generate-pdf', upload.any(), async (req, res) => {
 // finishes: the frontend calls /generate-pdf with the deal id it just received,
 // then brings the resulting URL back here.
 // ===========================================================================
+
+const INSPECTION_PDF_PROPERTY = 'inspection_pdf_url';
+
+/*
+ * Set once the property is known to exist in this process. HubSpot's property
+ * schema does not change under us, so re-checking on every submission would
+ * spend a request to learn what the first one already established.
+ */
+let inspectionPdfPropertyReady = false;
+
+/**
+ * Makes sure the deal property exists, creating it the first time it is needed.
+ *
+ * The PDF URL gets a property of its own rather than sharing damage_report_url:
+ * /inspection writes the shareable report-page link there, and overwriting it
+ * would cost ops the link to the report itself.
+ */
+async function ensureInspectionPdfProperty() {
+  if (inspectionPdfPropertyReady) return;
+
+  try {
+    await hubspot(`/crm/v3/properties/deals/${INSPECTION_PDF_PROPERTY}`);
+    inspectionPdfPropertyReady = true;
+    return;
+  } catch (err) {
+    // Anything but "not found" is a real failure — an expired token would
+    // otherwise be misread as a missing property and retried as a create.
+    if (err.status !== 404) throw err;
+  }
+
+  try {
+    await hubspot('/crm/v3/properties/deals', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: INSPECTION_PDF_PROPERTY,
+        label: 'Inspection PDF URL',
+        type: 'string',
+        fieldType: 'text',
+        groupName: 'dealinformation',
+      }),
+    });
+    console.log('[update-deal-pdf] created deal property', INSPECTION_PDF_PROPERTY);
+  } catch (err) {
+    /*
+     * 409 means another request created it between the check and this call.
+     * That is the outcome we wanted, so it is success rather than an error.
+     */
+    if (err.status !== 409) throw err;
+  }
+
+  inspectionPdfPropertyReady = true;
+}
 
 app.patch('/update-deal-pdf', async (req, res) => {
   try {
@@ -1779,12 +1973,16 @@ app.patch('/update-deal-pdf', async (req, res) => {
     );
     assertPipelineAllowed(deal?.properties?.pipeline);
 
+    // Before the write, so a missing property is created rather than surfacing
+    // as HubSpot rejecting the whole PATCH.
+    await ensureInspectionPdfProperty();
+
     await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
       method: 'PATCH',
-      body: JSON.stringify({ properties: { damage_report_url: pdfUrl } }),
+      body: JSON.stringify({ properties: { [INSPECTION_PDF_PROPERTY]: pdfUrl } }),
     });
 
-    console.log('[update-deal-pdf] wrote damage_report_url for deal', dealId);
+    console.log('[update-deal-pdf] wrote', INSPECTION_PDF_PROPERTY, 'for deal', dealId);
     return res.json({ success: true });
   } catch (err) {
     console.error('[update-deal-pdf] failed:', err);
