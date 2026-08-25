@@ -1958,6 +1958,297 @@ app.get('/report/:reportId', async (req, res) => {
   }
 });
 
+// ===========================================================================
+// /rep-deals — rep-facing deal status board (public/rep-dashboard.html)
+//
+// No auth, same as /report: internal use on a known URL. Reads and writes are
+// confined to the two roofing pipelines by the same guard every other route
+// uses, and stage advancement is capped well short of the ops-only stages.
+// ===========================================================================
+
+/*
+ * How far a rep may push a deal on their own, per pipeline.
+ *
+ * `sequence` is the rep-facing path through the pipeline and `limit` is the
+ * last stage they may land on — everything after it belongs to ops and is
+ * refused here rather than hidden in the UI, so a hand-made request cannot
+ * reach it either.
+ *
+ * Retail's sequence is a single stage: Intake is both the start and the limit,
+ * so retail deals never advance from this dashboard at all.
+ */
+const REP_STAGE_FLOW = {
+  [INSPECTION_PIPELINE]: {
+    sequence: [
+      '4130205409', // Site Inspection
+      '4109489900', // Contingency Signed
+      '4109489901', // Adjuster Meeting
+      '4109489902', // Pending Scope
+      '4109489903', // Scope Received/Review
+      '4142270177', // Contract Signed — the last stage a rep may set
+    ],
+    limit: '4142270177',
+  },
+  [RETAIL_PIPELINE]: {
+    sequence: ['4106670802'], // Intake — start and limit both
+    limit: '4106670802',
+  },
+};
+
+const REP_DEAL_PROPERTIES = [
+  'hs_object_id', 'dealname', 'customers_full_address', 'dealstage', 'pipeline',
+  'hs_lastmodifieddate', 'adjuster_meeting_date', 'closer', 'setter', 'amount',
+];
+
+const STAGE_LOCKED_MESSAGE = 'Stage advancement not permitted beyond this point. Please contact ops.';
+
+/**
+ * The stage a rep may move this deal to, or null when the deal is at or past
+ * the rep limit — including any stage outside the rep sequence entirely, which
+ * means ops has already taken it further than this dashboard reaches.
+ */
+function nextRepStage(pipelineId, currentStage) {
+  const flow = REP_STAGE_FLOW[String(pipelineId)];
+  if (!flow) return null;
+
+  const index = flow.sequence.indexOf(String(currentStage));
+  const limitIndex = flow.sequence.indexOf(flow.limit);
+  if (index < 0 || index >= limitIndex) return null;
+
+  return flow.sequence[index + 1] || null;
+}
+
+/**
+ * Resolves a typed name against the live `closer` and `setter` enumerations.
+ *
+ * Reuses resolveDealEnumOption — the same matcher the intake routes use, so a
+ * rep who types the name the way they always have gets the same answer here.
+ * The two properties carry different option lists, and a rep can appear on one,
+ * the other, or both.
+ */
+async function resolveRepIdentities(repName) {
+  const [closer, setter] = await Promise.all([
+    resolveCloserOption(repName).catch(err => {
+      console.error('[rep-deals] could not resolve closer options:', err.message);
+      return null;
+    }),
+    resolveSetterOption(repName).catch(err => {
+      console.error('[rep-deals] could not resolve setter options:', err.message);
+      return null;
+    }),
+  ]);
+  return { closer, setter };
+}
+
+/** Walks the search cursor to the end — a busy rep can hold more than one page. */
+async function searchRepDeals({ closer, setter }) {
+  // filterGroups are OR'd, filters inside one are AND'd. One group per role, each
+  // pinned to the two roofing pipelines, gives
+  // (closer = rep OR setter = rep) AND pipeline IN (insurance, retail).
+  const pipelineFilter = {
+    propertyName: 'pipeline',
+    operator: 'IN',
+    values: [INSPECTION_PIPELINE, RETAIL_PIPELINE],
+  };
+  const filterGroups = [];
+  if (closer) filterGroups.push({ filters: [{ propertyName: 'closer', operator: 'EQ', value: closer }, pipelineFilter] });
+  if (setter) filterGroups.push({ filters: [{ propertyName: 'setter', operator: 'EQ', value: setter }, pipelineFilter] });
+  if (!filterGroups.length) return [];
+
+  const collected = [];
+  let after;
+  // Bounded so a runaway cursor cannot spin forever; 10 pages is 1000 deals,
+  // far past any single rep's book.
+  for (let page = 0; page < 10; page += 1) {
+    const body = {
+      filterGroups,
+      properties: REP_DEAL_PROPERTIES,
+      sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'DESCENDING' }],
+      limit: 100,
+      ...(after ? { after } : {}),
+    };
+    const search = await hubspot('/crm/v3/objects/deals/search', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    collected.push(...(search?.results || []));
+    after = search?.paging?.next?.after;
+    if (!after) break;
+  }
+  return collected;
+}
+
+app.get('/rep-deals', async (req, res) => {
+  const repName = String(req.query.name || '').trim();
+  if (!repName) {
+    return res.status(400).json({ success: false, error: 'A rep name is required.' });
+  }
+
+  try {
+    const identities = await resolveRepIdentities(repName);
+    if (!identities.closer && !identities.setter) {
+      console.log('[rep-deals] no closer/setter option matched', JSON.stringify(repName));
+      return res.json({ success: true, repName, matched: null, insurance: [], retail: [] });
+    }
+
+    const results = await searchRepDeals(identities);
+
+    const insurance = [];
+    const retail = [];
+    for (const row of results) {
+      const p = row.properties || {};
+      const pipeline = String(p.pipeline || '');
+
+      // Structurally impossible given the search filter, but the guard is cheap
+      // and this is the one place deal data leaves the service.
+      if (pipeline !== INSPECTION_PIPELINE && pipeline !== RETAIL_PIPELINE) continue;
+
+      const isCloser = !!identities.closer && p.closer === identities.closer;
+      const isSetter = !!identities.setter && p.setter === identities.setter;
+
+      const deal = {
+        dealId: String(p.hs_object_id || row.id),
+        dealname: p.dealname || '',
+        address: p.customers_full_address || '',
+        dealstage: String(p.dealstage || ''),
+        pipeline,
+        lastModified: p.hs_lastmodifieddate || null,
+        adjusterMeetingDate: p.adjuster_meeting_date || null,
+        closer: p.closer || null,
+        setter: p.setter || null,
+        amount: p.amount || null,
+        role: isCloser && isSetter ? 'BOTH' : isCloser ? 'CLOSER' : 'SETTER',
+        // Sent so the card does not have to re-derive the rep limit client-side.
+        nextStage: nextRepStage(pipeline, p.dealstage),
+      };
+
+      (pipeline === INSPECTION_PIPELINE ? insurance : retail).push(deal);
+    }
+
+    console.log('[rep-deals]', JSON.stringify(repName),
+      '- matched closer:', identities.closer, 'setter:', identities.setter,
+      '- insurance:', insurance.length, 'retail:', retail.length);
+
+    return res.json({
+      success: true,
+      repName,
+      matched: { closer: identities.closer, setter: identities.setter },
+      insurance,
+      retail,
+    });
+  } catch (err) {
+    console.error('[rep-deals] lookup failed:', err);
+    return res.status(500).json({ success: false, error: 'Could not load deals from HubSpot.' });
+  }
+});
+
+/*
+ * Note to Deal, in HubSpot's default association catalogue. The v1 engagements
+ * API this replaces is deprecated; a note created here is the same activity-feed
+ * entry it produced.
+ */
+const NOTE_TO_DEAL_ASSOCIATION_TYPE_ID = 214;
+
+/** YYYY-MM-DD, which is what HubSpot accepts for a `date` property. */
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+app.post('/rep-deals/action', async (req, res) => {
+  const dealId = String(req.body?.dealId || '').trim();
+  const action = String(req.body?.action || '').trim();
+  const value = req.body?.value == null ? '' : String(req.body.value).trim();
+  const repName = String(req.body?.repName || '').trim();
+
+  if (!dealId) return res.status(400).json({ success: false, error: 'A deal id is required.' });
+  if (!['note', 'advance', 'date'].includes(action)) {
+    return res.status(400).json({ success: false, error: `Unknown action "${action}".` });
+  }
+
+  try {
+    /*
+     * The deal's own pipeline is read first and every decision below is made
+     * against it — never against a pipeline supplied by the caller. This is what
+     * keeps an Ops/Install deal unreachable no matter what is posted here.
+     */
+    const deal = await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}?properties=pipeline,dealstage,dealname`);
+    const pipeline = String(deal?.properties?.pipeline || '');
+    const currentStage = String(deal?.properties?.dealstage || '');
+    assertPipelineAllowed(pipeline);
+
+    if (action === 'note') {
+      if (!value) return res.status(400).json({ success: false, error: 'The note is empty.' });
+
+      // Attributed in the body: notes created by a private app carry no author,
+      // so without this ops cannot tell which rep left it.
+      const body = repName ? `${value}\n\n— ${repName} (rep dashboard)` : value;
+
+      await hubspot('/crm/v3/objects/notes', {
+        method: 'POST',
+        body: JSON.stringify({
+          properties: { hs_timestamp: Date.now(), hs_note_body: body },
+          associations: [{
+            to: { id: dealId },
+            types: [{
+              associationCategory: 'HUBSPOT_DEFINED',
+              associationTypeId: NOTE_TO_DEAL_ASSOCIATION_TYPE_ID,
+            }],
+          }],
+        }),
+      });
+
+      console.log('[rep-deals] note posted to deal', dealId, 'by', repName || 'unknown rep');
+      return res.json({ success: true });
+    }
+
+    if (action === 'advance') {
+      /*
+       * The live stage is the source of truth, not the one the card sent. A
+       * dashboard left open while ops moved the deal would otherwise advance
+       * from a stage the deal has already left.
+       */
+      if (value && value !== currentStage) {
+        return res.json({
+          success: false,
+          error: 'This deal has moved since the page was loaded. Tap Refresh and try again.',
+        });
+      }
+
+      const nextStage = nextRepStage(pipeline, currentStage);
+      if (!nextStage) {
+        console.log('[rep-deals] refused advance past rep limit — deal', dealId, 'stage', currentStage);
+        return res.json({ success: false, error: STAGE_LOCKED_MESSAGE });
+      }
+
+      // Re-asserted immediately before the write, so the guard sits on the same
+      // side of every early return above it.
+      assertPipelineAllowed(pipeline);
+      await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ properties: { dealstage: nextStage } }),
+      });
+
+      console.log('[rep-deals] deal', dealId, 'advanced', currentStage, '->', nextStage, 'by', repName || 'unknown rep');
+      return res.json({ success: true, dealstage: nextStage, nextStage: nextRepStage(pipeline, nextStage) });
+    }
+
+    // action === 'date'
+    if (!ISO_DATE_PATTERN.test(value)) {
+      return res.status(400).json({ success: false, error: 'A date in YYYY-MM-DD format is required.' });
+    }
+
+    assertPipelineAllowed(pipeline);
+    await hubspot(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ properties: { adjuster_meeting_date: value } }),
+    });
+
+    console.log('[rep-deals] adjuster meeting date set on deal', dealId, 'to', value, 'by', repName || 'unknown rep');
+    return res.json({ success: true, adjusterMeetingDate: value });
+  } catch (err) {
+    console.error('[rep-deals] action failed:', action, 'deal', dealId, err);
+    return res.status(500).json({ success: false, error: 'Could not update the deal in HubSpot.' });
+  }
+});
+
 /*
  * Registered last, so it catches what the route handlers cannot: multer rejects
  * a file (bad type, over the size limit) in middleware, before any route runs,
