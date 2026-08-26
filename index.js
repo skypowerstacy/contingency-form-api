@@ -541,7 +541,7 @@ app.post('/submit', upload.array('files', 10), async (req, res) => {
     return res.status(400).json({
       success: false,
       error: 'FILE_TOO_LARGE',
-      message: 'Total upload size exceeds 200MB. Please remove some photos and try again.',
+      message: 'Total upload size exceeds 500MB. Please remove some photos and try again.',
     });
   }
 
@@ -1179,7 +1179,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
     return res.status(400).json({
       success: false,
       error: 'FILE_TOO_LARGE',
-      message: 'Total upload size exceeds 200MB. Please remove some photos and try again.',
+      message: 'Total upload size exceeds 500MB. Please remove some photos and try again.',
     });
   }
 
@@ -2335,7 +2335,7 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
     return res.status(400).json({
       success: false,
       error: 'FILE_TOO_LARGE',
-      message: 'Total upload size exceeds 200MB. Please remove some files and try again.',
+      message: 'Total upload size exceeds 500MB. Please remove some files and try again.',
     });
   }
 
@@ -2551,7 +2551,7 @@ app.post('/scope', upload.any(), async (req, res) => {
     return res.status(400).json({
       success: false,
       error: 'FILE_TOO_LARGE',
-      message: 'Total upload size exceeds 200MB. Please remove some photos and try again.',
+      message: 'Total upload size exceeds 500MB. Please remove some photos and try again.',
     });
   }
 
