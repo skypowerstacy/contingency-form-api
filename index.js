@@ -119,10 +119,10 @@ function assertPipelineAllowed(pipelineId) {
 }
 
 /*
- * Total-upload cap, checked per route after parsing — multer has no option for
- * a combined limit.
+ * Total-upload cap of 500MB, checked per route after parsing — multer has no
+ * option for a combined limit.
  */
-const MAX_TOTAL_UPLOAD_BYTES = 200 * 1024 * 1024;
+const MAX_TOTAL_UPLOAD_BYTES = 500 * 1024 * 1024;
 
 /*
  * Per-file cap, applied by each upload route after parsing rather than by
