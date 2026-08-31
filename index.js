@@ -371,8 +371,98 @@ async function uploadFilesAndZip({ bucket, slug, files, zipName, label, defaultE
 }
 
 /**
+ * Fallback lookup: searches deals directly on customers_full_address.
+ *
+ * The contact path only finds a deal that hangs off a contact whose `address`
+ * carries the street number. A deal created without a contact, or with the
+ * address recorded on the deal and not the contact, is invisible to it — and
+ * the callers read a null as "no such deal", which for /submit and
+ * /retail-submission means creating a duplicate.
+ *
+ * Scoring is identical to the contact path. The one difference is the name:
+ * there is no firstname/lastname here, so the deal name stands in as the
+ * candidate — HubSpot deal names carry the homeowner, so the same token overlap
+ * still discriminates between two deals on one street number.
+ *
+ * Returns null rather than throwing on any failure. The caller has already been
+ * told nothing matched by the contact path; turning that into an exception
+ * would stop /submit creating the deal it would otherwise have created.
+ */
+async function findDealByAddressDirect(target, token, rawName, pipelineId) {
+  const pipeline = String(pipelineId);
+
+  /*
+   * Belt and braces alongside the pipeline filter below. The filter already
+   * scopes the search, but this route reads deal data out to the caller, and
+   * Ops/Install must be unreachable from here by construction rather than by
+   * whatever the caller happened to pass.
+   */
+  if (pipeline === FORBIDDEN_PIPELINE) {
+    console.error('[deal-lookup] refusing to search pipeline', FORBIDDEN_PIPELINE, '(Ops/Install)');
+    return null;
+  }
+
+  try {
+    const search = await hubspot('/crm/v3/objects/deals/search', {
+      method: 'POST',
+      body: JSON.stringify({
+        filterGroups: [{
+          filters: [
+            { propertyName: 'customers_full_address', operator: 'CONTAINS_TOKEN', value: token },
+            { propertyName: 'pipeline', operator: 'EQ', value: pipeline },
+          ],
+        }],
+        properties: ['customers_full_address', 'dealname', 'pipeline', 'dealstage'],
+        limit: 100,
+      }),
+    });
+
+    const round = n => Number(n.toFixed(2));
+
+    const scored = (search?.results || []).map(deal => {
+      const address = scoreAddress(target, normaliseAddress(deal.properties?.customers_full_address));
+      /*
+       * scoreName expects contact-shaped properties, so the deal name goes in
+       * as the whole name — nameTokens() splits it either way, and routing it
+       * through scoreName keeps the neutral-score-for-no-name rule identical.
+       */
+      const name = scoreName(rawName, { firstname: deal.properties?.dealname });
+      const combined = (address * ADDRESS_WEIGHT) + (name * NAME_WEIGHT);
+      console.log('[deal-lookup] deal candidate scores:',
+        { address: round(address), name: round(name), combined: round(combined) },
+        '- deal:', deal.id, JSON.stringify(deal.properties?.customers_full_address || ''));
+      return { deal, combined };
+    });
+
+    // Highest first, so the best match wins when a street number repeats.
+    const candidates = scored
+      .filter(c => c.combined >= MATCH_THRESHOLD)
+      .sort((a, b) => b.combined - a.combined);
+
+    console.log('[deal-lookup] deal-direct fallback - token:', token,
+      '- pipeline:', pipeline,
+      '- deals searched:', scored.length, '- above threshold:', candidates.length);
+
+    if (!candidates.length) return null;
+
+    const best = candidates[0].deal;
+    return {
+      dealId: String(best.id),
+      pipeline: String(best.properties?.pipeline || pipeline),
+      // No contact was involved in finding this one, and the callers only use
+      // this to re-associate — a wrong id would be worse than none.
+      contactId: null,
+      dealname: best.properties?.dealname,
+    };
+  } catch (err) {
+    console.error('[deal-lookup] deal-direct fallback failed:', err.message || err);
+    return null;
+  }
+}
+
+/**
  * Finds the Roofing - Insurance deal for a property by matching the address on
- * the associated contact.
+ * the associated contact, falling back to searching deals directly.
  *
  * HubSpot search cannot express "roughly this address", so it is narrowed
  * server-side on the street number (the most selective token) and the fuzzy
@@ -426,7 +516,16 @@ async function findDealByAddress(rawAddress, rawName, pipelineId = INSPECTION_PI
       }
     }
   }
-  return null;
+
+  /*
+   * Reached whenever the contact path came up empty — no candidate cleared the
+   * threshold, or the ones that did carry no deal in the target pipeline.
+   * Either way the caller is about to be told there is no such deal, so the
+   * cheaper question is worth asking first.
+   */
+  console.log('[deal-lookup] no contact-associated deal in pipeline', String(pipelineId),
+    '- falling back to deal-direct address search');
+  return findDealByAddressDirect(target, token, rawName, pipelineId);
 }
 
 async function updateContingencyDeal(deal, fields, zipUrl) {
