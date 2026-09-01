@@ -3902,7 +3902,12 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
       const properties = {
         pipeline: SOLAR_PIPELINE,
         dealstage: SOLAR_STAGE,
-        dealname: `[OPS] ${[fields.firstname, fields.lastname].filter(Boolean).join(' ')}`.trim(),
+        /*
+         * Homeowner name alone — no prefix. Falls back rather than sending an
+         * empty string: without the old "[OPS]" in front, a submission missing
+         * both names would otherwise create a deal with no name at all.
+         */
+        dealname: [fields.firstname, fields.lastname].filter(Boolean).join(' ').trim() || 'Unknown homeowner',
         customers_full_address: fields.customers_full_address,
         customer_cell_phone: fields.customer_cell,
         customer_email: fields.customer_email,
