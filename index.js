@@ -3365,6 +3365,601 @@ app.post('/rep-deals/action', async (req, res) => {
 });
 
 // ===========================================================================
+// /solar-submission — solar project intake from public/solar-submission.html
+//
+// AUTHORIZED EXCEPTION: this endpoint is the sole legitimate writer to the
+// Operations pipeline. All other endpoints are still forbidden.
+//
+// FORBIDDEN_PIPELINE / assertPipelineAllowed() stay exactly as they are and
+// still refuse pipeline 1022523097 everywhere else in this service. Nothing
+// below calls them — this route carries its own guard instead, so the
+// exemption cannot leak into another code path by accident.
+// ===========================================================================
+
+const SOLAR_PIPELINE = '1022523097';
+const SOLAR_STAGE = '1578819287'; // Intake
+const SOLAR_BUCKET = 'solar';
+
+/**
+ * The counterpart to assertPipelineAllowed() for this one route: where that
+ * guard refuses the Operations pipeline, this one refuses everything else.
+ * Called immediately before the deal write so a constant that has been
+ * reassigned, shadowed, or built from a request value cannot slip through.
+ */
+function assertSolarPipeline(pipelineId) {
+  if (String(pipelineId) !== SOLAR_PIPELINE) {
+    throw new Error(
+      `/solar-submission writes only to pipeline ${SOLAR_PIPELINE}; refusing ${pipelineId}.`
+    );
+  }
+}
+
+/*
+ * Per-file and total caps for this route only. Deliberately different from
+ * MAX_FILE_BYTES: a solar intake carries five documents, not a roof's worth of
+ * photos, and a scanned install agreement legitimately runs large.
+ */
+const SOLAR_MAX_FILE_BYTES = 90 * 1024 * 1024;
+const SOLAR_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
+
+const SOLAR_FILE_FIELDS = [
+  { field: 'utility_bill', label: 'Utility Bill' },
+  { field: 'proposal', label: 'Proposal' },
+  { field: 'install_agreement', label: 'Install Agreement' },
+  { field: 'site_map', label: 'Site Map' },
+  { field: 'home_photo', label: 'Picture of Home' },
+];
+
+// ---- Deal property options: fetched live, cached briefly -------------------
+
+/*
+ * HubSpot's enumeration options are the source of truth for what this service
+ * is allowed to write. They change when ops adds a rep or a battery model, so
+ * they are read at runtime rather than mirrored in code — and cached for five
+ * minutes so a submission does not spend a request per enum field.
+ */
+const PROPERTY_OPTIONS_TTL_MS = 5 * 60 * 1000;
+const propertyOptionsCache = new Map();
+
+async function fetchPropertyOptions(propertyName) {
+  const cached = propertyOptionsCache.get(propertyName);
+  if (cached && Date.now() - cached.at < PROPERTY_OPTIONS_TTL_MS) return cached.options;
+
+  const property = await hubspot(`/crm/v3/properties/deals/${propertyName}`);
+  const options = Array.isArray(property?.options) ? property.options : [];
+  propertyOptionsCache.set(propertyName, { at: Date.now(), options });
+  return options;
+}
+
+// ---- Fuzzy enum matching --------------------------------------------------
+
+/*
+ * Dice coefficient over character bigrams, 0..1.
+ *
+ * Written here rather than pulled in as a dependency: the service has no fuzzy
+ * matching library, and this is a dozen lines that never needs updating.
+ * Character bigrams rather than word tokens because the mismatches that
+ * actually occur are spacing and casing — "Enphase 10kw" against
+ * "Enphase 10 kW" scores 0.87 here and 0 on word overlap.
+ */
+function enumBigrams(value) {
+  const s = String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const grams = new Set();
+  for (let i = 0; i < s.length - 1; i += 1) grams.add(s.slice(i, i + 2));
+  return { grams, s };
+}
+
+function enumScore(submitted, candidate) {
+  const a = enumBigrams(submitted);
+  const b = enumBigrams(candidate);
+  // A one-character value has no bigrams; fall back to equality.
+  if (!a.grams.size || !b.grams.size) return a.s && a.s === b.s ? 1 : 0;
+  let hits = 0;
+  for (const gram of a.grams) if (b.grams.has(gram)) hits += 1;
+  return (2 * hits) / (a.grams.size + b.grams.size);
+}
+
+const ENUM_MATCH_THRESHOLD = 0.6;
+
+/**
+ * Resolves a submitted string to an allowed option VALUE for a deal property.
+ *
+ * Never throws. Returns { value, skipped, reason } — a null value with
+ * skipped:true means the caller must leave the property off the payload
+ * entirely. That is the whole point: HubSpot rejects an unknown enumeration
+ * value and fails the entire deal write with it, so a rep typo or a renamed
+ * option would otherwise cost the submission rather than one field.
+ */
+async function resolveEnumValue(propertyName, submitted) {
+  const raw = String(submitted == null ? '' : submitted).trim();
+  if (!raw) return { value: null, skipped: false, reason: 'not submitted' };
+
+  let options;
+  try {
+    options = await fetchPropertyOptions(propertyName);
+  } catch (err) {
+    return { value: null, skipped: true, reason: `could not read options: ${err.message || err}` };
+  }
+  if (!options.length) {
+    return { value: null, skipped: true, reason: 'property has no options' };
+  }
+
+  // Exact first, so a value that already matches never depends on the score.
+  const exact = options.find(o => normaliseName(o.value) === normaliseName(raw));
+  if (exact) return { value: exact.value, skipped: false, score: 1 };
+
+  let best = null;
+  let bestScore = 0;
+  for (const option of options) {
+    const score = enumScore(raw, option.value);
+    if (score > bestScore) {
+      bestScore = score;
+      best = option;
+    }
+  }
+
+  if (best && bestScore >= ENUM_MATCH_THRESHOLD) {
+    return { value: best.value, skipped: false, score: bestScore };
+  }
+  return {
+    value: null,
+    skipped: true,
+    reason: `no option scored ${ENUM_MATCH_THRESHOLD}+ (best: ${best ? best.value : 'none'} at ${bestScore.toFixed(2)})`,
+  };
+}
+
+// ---- GET /options/reps ----------------------------------------------------
+
+/*
+ * Rep names that live in the closer/setter enumerations but are not people.
+ * Filtered so the form's dropdowns show reps only.
+ */
+const REP_OPTION_BLOCKLIST = new Set([
+  'N/A',
+  'Reset',
+  'Reset by Stef',
+  'FB Marketing',
+  'Mktg Event',
+  'Website',
+]);
+
+let repOptionsCache = null;
+
+function repLabels(options) {
+  return options
+    .map(o => String(o?.label ?? '').trim())
+    .filter(label => label && !REP_OPTION_BLOCKLIST.has(label))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+/*
+ * Read-only. Lets the solar form render the live rep list without a deploy
+ * every time ops adds someone.
+ *
+ * A failure is a 500 rather than an empty list on purpose: the form falls back
+ * to free-text inputs when this errors, and an empty 200 would instead render
+ * two dropdowns with nothing in them and no way to submit a rep name at all.
+ */
+app.get('/options/reps', async (req, res) => {
+  // The global cors() middleware already covers this, but the browser must
+  // never be left guessing on the one request the form blocks its dropdowns on.
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+
+  try {
+    if (repOptionsCache && Date.now() - repOptionsCache.at < PROPERTY_OPTIONS_TTL_MS) {
+      return res.json(repOptionsCache.payload);
+    }
+
+    const [closerOptions, setterOptions] = await Promise.all([
+      fetchPropertyOptions('closer'),
+      fetchPropertyOptions('setter'),
+    ]);
+
+    const payload = {
+      closers: repLabels(closerOptions),
+      setters: repLabels(setterOptions),
+    };
+
+    repOptionsCache = { at: Date.now(), payload };
+    console.log('[options/reps] closers:', payload.closers.length, '- setters:', payload.setters.length);
+    return res.json(payload);
+  } catch (err) {
+    console.error('[options/reps] lookup failed:', err);
+    return res.status(500).json({ error: 'Failed to load rep options' });
+  }
+});
+
+// ---- POST /solar-submission -----------------------------------------------
+
+const SOLAR_TEXT_FIELDS = [
+  'firstname', 'lastname', 'customers_full_address', 'customer_cell', 'customer_email',
+  'closer', 'setter', 'system_size_kw', 'base_price_per_watt', 'final_price_per_watt',
+  'date_signed', 'funding', 'funding_partner', 'system_price',
+  'battery', 'generator', 'utility_company', 'perfect_power_box', 'current_roof_material',
+  'adders', 'additional_adders', 'hoa', 'hoa_contact',
+  'special_project_notes', 'additional_notes', 'how_heard',
+];
+
+/** Number, or undefined when the field was blank or unparseable. */
+function solarNumber(value) {
+  const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function solarEmailHtml(fields, folderUrl, dealId, skipped, warnings) {
+  const row = (label, value) => `
+    <tr>
+      <td style="padding:6px 12px 6px 0;color:#6b7280;font-size:13px;vertical-align:top;white-space:nowrap">${escapeHtml(label)}</td>
+      <td style="padding:6px 0;color:#111827;font-size:13px">${escapeHtml(value || '—')}</td>
+    </tr>`;
+
+  const table = rows => `<table style="width:100%;border-collapse:collapse">${rows.join('')}</table>`;
+  const heading = text => `<h2 style="font-size:14px;margin:24px 0 8px;color:#111827">${escapeHtml(text)}</h2>`;
+
+  const fullName = [fields.firstname, fields.lastname].filter(Boolean).join(' ');
+
+  const customer = table([
+    row('Name', fullName),
+    row('Address', fields.customers_full_address),
+    row('Cell', fields.customer_cell),
+    row('Email', fields.customer_email),
+  ]);
+
+  const dealRows = [
+    row('Closer', fields.closer),
+    row('Setter', fields.setter),
+    row('System size (kW)', fields.system_size_kw),
+    row('Base price per watt', fields.base_price_per_watt ? `$${fields.base_price_per_watt}` : ''),
+    row('Final price per watt', fields.final_price_per_watt ? `$${fields.final_price_per_watt}` : ''),
+    row('Date signed', fields.date_signed),
+    row('Funding', fields.funding),
+  ];
+  // Cash deals have no lender, so the row would only ever read "—".
+  if (fields.funding && fields.funding.toLowerCase() !== 'cash') {
+    dealRows.push(row('Funding partner', fields.funding_partner));
+  }
+  dealRows.push(row('System price / loan amount', fields.system_price ? `$${fields.system_price}` : ''));
+
+  const system = table([
+    row('Battery', fields.battery),
+    row('Generator', fields.generator),
+    row('Utility company', fields.utility_company),
+    row('Perfect Power Box', fields.perfect_power_box),
+    row('Current roof material', fields.current_roof_material),
+  ]);
+
+  const adderList = String(fields.adders || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const addersBlock = adderList.length
+    ? `<ul style="margin:8px 0;padding-left:20px;color:#111827;font-size:13px">${
+        adderList.map(a => `<li>${escapeHtml(a)}</li>`).join('')
+      }</ul>`
+    : `<p style="margin:8px 0;color:#6b7280;font-size:13px">No adders selected.</p>`;
+  const extraAdders = fields.additional_adders
+    ? `<p style="margin:8px 0;font-size:13px;color:#111827"><strong>Additional:</strong> ${escapeHtml(fields.additional_adders)}</p>`
+    : '';
+
+  const hoaRows = [row('HOA', fields.hoa)];
+  if (String(fields.hoa || '').toLowerCase() === 'yes') {
+    hoaRows.push(row('HOA contact info', fields.hoa_contact));
+  }
+
+  const docsBlock = folderUrl
+    ? `<p style="margin:8px 0;font-size:13px"><a href="${escapeHtml(folderUrl)}" style="color:#C9922A">View Uploaded Documents →</a></p>`
+    : `<p style="margin:8px 0;color:#6b7280;font-size:13px">Documents were not uploaded to storage.</p>`;
+
+  const notes = table([
+    row('Customer expectations / special project notes', fields.special_project_notes),
+    row('Additional notes', fields.additional_notes),
+    // Collected for marketing attribution and deliberately not written to
+    // HubSpot — this email is the only place it lands.
+    row('How did they hear about us', fields.how_heard),
+  ]);
+
+  const skippedBlock = skipped.length
+    ? `${heading('Fields not written to HubSpot')}
+       <p style="margin:0 0 8px;color:#b45309;font-size:12px">These did not match an allowed HubSpot option and were left off the deal. Set them by hand if they matter.</p>
+       <ul style="margin:8px 0;padding-left:20px;color:#b45309;font-size:12px">${
+         skipped.map(s => `<li><strong>${escapeHtml(s.property)}</strong> — submitted "${escapeHtml(s.submitted)}" (${escapeHtml(s.reason)})</li>`).join('')
+       }</ul>`
+    : '';
+
+  const dealBlock = dealId
+    ? `<p style="margin:16px 0 0;font-size:13px"><a href="https://app.hubspot.com/contacts/deals/${escapeHtml(dealId)}" style="color:#C9922A">Open the HubSpot deal →</a></p>`
+    : `<p style="margin:16px 0 0;color:#6b7280;font-size:13px">HubSpot deal was not created.</p>`;
+
+  const warnBlock = warnings.length
+    ? `<p style="margin:16px 0 0;color:#b45309;font-size:12px">Partial submission — ${escapeHtml(warnings.join(' · '))}</p>`
+    : '';
+
+  return `
+    <div style="font-family: sans-serif; max-width: 640px; margin: 0 auto;">
+      <div style="background:#1B2A4A;padding:24px;border-radius:8px 8px 0 0">
+        <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — New Solar Submission</h1>
+      </div>
+      <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
+        ${heading('Customer')}${customer}
+        ${heading('Deal')}${table(dealRows)}
+        ${heading('System')}${system}
+        ${heading('Adders')}${addersBlock}${extraAdders}
+        ${heading('HOA')}${table(hoaRows)}
+        ${heading('Documents')}${docsBlock}
+        ${heading('Notes')}${notes}
+        ${skippedBlock}
+        ${dealBlock}
+        ${warnBlock}
+      </div>
+    </div>
+  `;
+}
+
+app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: f.field, maxCount: 1 }))), async (req, res) => {
+  const warnings = [];
+  const skipped = [];
+  let dealId = null;
+  let contactId = null;
+  let folderUrl = null;
+  let fields = {};
+
+  try {
+    fields = {};
+    for (const key of SOLAR_TEXT_FIELDS) fields[key] = (req.body?.[key] ?? '').toString().trim();
+
+    /*
+     * upload.fields() groups by fieldname; flatten to a list and apply the same
+     * soft-skip the other routes use — an oversized document drops out and the
+     * rest of the submission goes through.
+     */
+    const allFiles = Object.values(req.files || {}).flat();
+    const oversized = allFiles.filter(f => f.size > SOLAR_MAX_FILE_BYTES);
+    const acceptedFiles = allFiles.filter(f => f.size <= SOLAR_MAX_FILE_BYTES);
+    if (oversized.length) {
+      console.warn('[solar-submission] skipped oversized files:',
+        oversized.map(f => `${f.fieldname}/${f.originalname} (${(f.size / 1024 / 1024).toFixed(1)}MB)`));
+      warnings.push(`${oversized.length} file(s) over 90MB were skipped`);
+    }
+
+    const totalBytes = acceptedFiles.reduce((sum, f) => sum + f.size, 0);
+    if (totalBytes > SOLAR_MAX_TOTAL_BYTES) {
+      return res.status(400).json({
+        success: false,
+        error: 'FILE_TOO_LARGE',
+        message: 'Total upload size exceeds 200MB. Please remove or compress some documents and try again.',
+      });
+    }
+
+    console.log('[solar-submission] files received:',
+      acceptedFiles.map(f => `${f.fieldname}=${f.originalname}`).join(' ') || '(none)');
+
+    // ---- Enum resolution, before anything is written ----
+    const note = (property, submitted, result) => {
+      if (result.skipped) {
+        console.warn('[solar-submission] skipping enum field', property,
+          '- submitted:', JSON.stringify(submitted), '- reason:', result.reason);
+        skipped.push({ property, submitted, reason: result.reason });
+      } else if (result.value && result.score !== 1) {
+        console.log('[solar-submission] fuzzy-matched', property,
+          JSON.stringify(submitted), '->', JSON.stringify(result.value), 'at', result.score.toFixed(2));
+      }
+      return result.value;
+    };
+
+    const isCash = fields.funding.toLowerCase() === 'cash';
+
+    const [closer, setter, funding, financier, battery, generator, utility, ppb] = await Promise.all([
+      resolveEnumValue('closer', fields.closer).then(r => note('closer', fields.closer, r)),
+      resolveEnumValue('setter', fields.setter).then(r => note('setter', fields.setter, r)),
+      resolveEnumValue('funding', fields.funding).then(r => note('funding', fields.funding, r)),
+      // A cash deal has no lender; asking would only produce a skip to explain.
+      isCash
+        ? Promise.resolve(null)
+        : resolveEnumValue('financier', fields.funding_partner).then(r => note('financier', fields.funding_partner, r)),
+      resolveEnumValue('battery', fields.battery).then(r => note('battery', fields.battery, r)),
+      resolveEnumValue('generac_generator', fields.generator).then(r => note('generac_generator', fields.generator, r)),
+      resolveEnumValue('utility', fields.utility_company).then(r => note('utility', fields.utility_company, r)),
+      resolveEnumValue('perfect_power_box', fields.perfect_power_box).then(r => note('perfect_power_box', fields.perfect_power_box, r)),
+    ]);
+
+    /*
+     * adders is multi-select: each submitted value is resolved on its own, so
+     * one unrecognised adder costs that adder rather than the whole set.
+     */
+    const submittedAdders = fields.adders.split(',').map(s => s.trim()).filter(Boolean);
+    const matchedAdders = [];
+    for (const adder of submittedAdders) {
+      const result = await resolveEnumValue('adders', adder);
+      const value = note('adders', adder, result);
+      if (value) matchedAdders.push(value);
+    }
+
+    // ---- HubSpot ----
+    try {
+      contactId = await upsertContact({
+        fname: fields.firstname,
+        lname: fields.lastname,
+        customer_email: fields.customer_email,
+        phone: fields.customer_cell,
+        address: fields.customers_full_address,
+      });
+    } catch (err) {
+      console.error('[solar-submission] contact upsert failed:', err);
+      warnings.push('HubSpot contact was not created');
+    }
+
+    try {
+      // The one place this service may write to Operations. Checked here, at
+      // the write, rather than trusting the constant to still hold.
+      assertSolarPipeline(SOLAR_PIPELINE);
+
+      const properties = {
+        pipeline: SOLAR_PIPELINE,
+        dealstage: SOLAR_STAGE,
+        dealname: `[OPS] ${[fields.firstname, fields.lastname].filter(Boolean).join(' ')}`.trim(),
+        customers_full_address: fields.customers_full_address,
+        customer_cell_phone: fields.customer_cell,
+        customer_email: fields.customer_email,
+        current_roof_material: fields.current_roof_material,
+      };
+
+      const setIf = (key, value) => {
+        if (value !== undefined && value !== null && value !== '') properties[key] = value;
+      };
+
+      setIf('closer', closer);
+      setIf('setter', setter);
+      setIf('funding', funding);
+      setIf('financier', financier);
+      setIf('battery', battery);
+      setIf('generac_generator', generator);
+      setIf('utility', utility);
+      setIf('perfect_power_box', ppb);
+
+      setIf('system_size__kw_', solarNumber(fields.system_size_kw));
+      setIf('base_price_per_watt', solarNumber(fields.base_price_per_watt));
+      setIf('final_price_per_watt', solarNumber(fields.final_price_per_watt));
+
+      const price = solarNumber(fields.system_price);
+      setIf('amount', price);
+      setIf('total_loan_amount', price);
+
+      if (/^\d{4}-\d{2}-\d{2}$/.test(fields.date_signed)) {
+        setIf('date_signed', fields.date_signed);
+        // HubSpot date properties are midnight UTC in epoch milliseconds.
+        const ms = Date.parse(`${fields.date_signed}T00:00:00Z`);
+        if (Number.isFinite(ms)) setIf('closedate', ms);
+      } else if (fields.date_signed) {
+        console.warn('[solar-submission] date_signed not YYYY-MM-DD, skipping:', fields.date_signed);
+        skipped.push({ property: 'date_signed', submitted: fields.date_signed, reason: 'not a YYYY-MM-DD date' });
+      }
+
+      /*
+       * HubSpot represents a multi-select enumeration on the wire as a
+       * semicolon-delimited string, not a JSON array — an array is rejected and
+       * would fail the whole deal write, which is the exact outcome the enum
+       * safety above exists to prevent.
+       */
+      if (matchedAdders.length) properties.adders = matchedAdders.join(';');
+
+      if (String(fields.hoa).toLowerCase() === 'yes' && fields.hoa_contact) {
+        properties.hoa_contact = fields.hoa_contact;
+      }
+
+      setIf('special_project_notes', fields.special_project_notes);
+
+      const accountNotes = fields.additional_adders
+        ? `Additional adders: ${fields.additional_adders}\n\n${fields.additional_notes}`
+        : fields.additional_notes;
+      setIf('account_notes', accountNotes);
+
+      const deal = await hubspot('/crm/v3/objects/deals', {
+        method: 'POST',
+        body: JSON.stringify({ properties }),
+      });
+      dealId = deal.id;
+
+      if (contactId) {
+        try {
+          await hubspot(
+            `/crm/v4/objects/deals/${dealId}/associations/default/contacts/${contactId}`,
+            { method: 'PUT' }
+          );
+        } catch (err) {
+          console.error('[solar-submission] contact association failed:', err);
+          warnings.push('Contact was not associated with the deal');
+        }
+      }
+
+      console.log('[solar-submission] created deal', dealId, 'in pipeline', SOLAR_PIPELINE,
+        'with', Object.keys(properties).join(', '));
+    } catch (err) {
+      console.error('[solar-submission] deal creation failed:', err);
+      warnings.push('HubSpot deal was not created');
+    }
+
+    // ---- Supabase ----
+    // Filed under the deal id, so without one there is nowhere to put them.
+    if (dealId && acceptedFiles.length) {
+      try {
+        const supabase = createSupabaseClient();
+        const failed = [];
+
+        await Promise.all(acceptedFiles.map(async (file) => {
+          const safeName = String(file.originalname || 'document').replace(/[^\w.\-]/g, '_');
+          const objectPath = `${dealId}/${file.fieldname}/${safeName}`;
+          try {
+            const { error } = await supabase.storage.from(SOLAR_BUCKET).upload(objectPath, file.buffer, {
+              contentType: file.mimetype,
+              upsert: true,
+            });
+            if (error) failed.push(`${objectPath}: ${error.message}`);
+          } catch (err) {
+            failed.push(`${objectPath}: ${err.message || err}`);
+          }
+        }));
+
+        if (failed.length) {
+          console.error('[solar-submission] document uploads failed:', failed);
+          warnings.push(`${failed.length} document(s) failed to upload`);
+        }
+
+        if (failed.length < acceptedFiles.length) {
+          folderUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${SOLAR_BUCKET}/${dealId}/`;
+          try {
+            assertSolarPipeline(SOLAR_PIPELINE);
+            await hubspot(`/crm/v3/objects/deals/${dealId}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ properties: { intake_gdrive_link: folderUrl } }),
+            });
+          } catch (err) {
+            console.error('[solar-submission] could not write intake_gdrive_link:', err);
+            warnings.push('Document folder URL was not written to the deal');
+          }
+        }
+      } catch (err) {
+        // Storage is best effort — the deal and the email are what ops needs.
+        console.error('[solar-submission] Supabase upload failed:', err);
+        warnings.push('Documents were not uploaded to storage');
+      }
+    } else if (!dealId && acceptedFiles.length) {
+      warnings.push('Documents were not uploaded — no deal id to file them under');
+    }
+
+    // ---- Ops email (always attempted, with whatever survived above) ----
+    try {
+      await resend.emails.send({
+        from: 'NuHome Forms <noreply@thehiveoffice.com>',
+        to: ['mariah@thenuhome.com', 'misty@thenuhome.com'],
+        subject: `New Solar Submission — ${[fields.firstname, fields.lastname].filter(Boolean).join(' ') || 'Unknown'} | ${fields.customers_full_address || 'No address'}`,
+        html: solarEmailHtml(fields, folderUrl, dealId, skipped, warnings),
+      });
+    } catch (err) {
+      console.error('[solar-submission] ops email failed:', err);
+      warnings.push('Ops email was not sent');
+    }
+
+    return res.json({
+      success: true,
+      dealId,
+      folderUrl,
+      ...(skipped.length ? { skippedFields: skipped } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    });
+  } catch (err) {
+    console.error('[solar-submission] unhandled error:', err);
+    // Never a bare 500 — the browser always gets JSON it can render.
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Solar submission failed.',
+      dealId,
+      folderUrl,
+    });
+  }
+});
+
+// ===========================================================================
 // /admin-deals — every open roofing deal, for public/admin-dashboard.html
 //
 // The one authenticated route in this service. ADMIN_TOKEN must be set in
