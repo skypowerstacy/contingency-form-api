@@ -3403,11 +3403,13 @@ const SOLAR_MAX_FILE_BYTES = 90 * 1024 * 1024;
 const SOLAR_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
 
 const SOLAR_FILE_FIELDS = [
-  { field: 'utility_bill', label: 'Utility Bill' },
-  { field: 'proposal', label: 'Proposal' },
-  { field: 'install_agreement', label: 'Install Agreement' },
-  { field: 'site_map', label: 'Site Map' },
-  { field: 'home_photo', label: 'Picture of Home' },
+  { field: 'utility_bill', label: 'Utility Bill', maxCount: 1 },
+  { field: 'proposal', label: 'Proposal', maxCount: 1 },
+  { field: 'install_agreement', label: 'Install Agreement', maxCount: 1 },
+  // Panels, meter and MSP are usually three separate photos, so this is the
+  // one slot that takes more than one file. The form caps at the same number.
+  { field: 'site_map', label: 'Site Map', maxCount: 10 },
+  { field: 'home_photo', label: 'Picture of Home', maxCount: 1 },
 ];
 
 // ---- Deal property options: fetched live, cached briefly -------------------
@@ -3783,7 +3785,7 @@ function solarEmailHtml(fields, folderUrl, dealId, skipped, warnings) {
   `;
 }
 
-app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: f.field, maxCount: 1 }))), async (req, res) => {
+app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: f.field, maxCount: f.maxCount || 1 }))), async (req, res) => {
   const warnings = [];
   const skipped = [];
   let dealId = null;
@@ -3973,9 +3975,34 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
         const supabase = createSupabaseClient();
         const failed = [];
 
+        /*
+         * site_map can carry several files, and a phone will happily hand over
+         * two both named image.jpg. Same field plus same name is the same
+         * storage path, and upsert:true would silently overwrite the first —
+         * so a repeat within a field gets a numeric suffix.
+         */
+        const usedPaths = new Set();
+        const uniquePath = (fieldname, safeName) => {
+          let candidate = `${dealId}/${fieldname}/${safeName}`;
+          if (!usedPaths.has(candidate)) {
+            usedPaths.add(candidate);
+            return candidate;
+          }
+          const dot = safeName.lastIndexOf('.');
+          const stem = dot > 0 ? safeName.slice(0, dot) : safeName;
+          const ext = dot > 0 ? safeName.slice(dot) : '';
+          for (let i = 2; ; i += 1) {
+            candidate = `${dealId}/${fieldname}/${stem}-${i}${ext}`;
+            if (!usedPaths.has(candidate)) {
+              usedPaths.add(candidate);
+              return candidate;
+            }
+          }
+        };
+
         await Promise.all(acceptedFiles.map(async (file) => {
           const safeName = String(file.originalname || 'document').replace(/[^\w.\-]/g, '_');
-          const objectPath = `${dealId}/${file.fieldname}/${safeName}`;
+          const objectPath = uniquePath(file.fieldname, safeName);
           try {
             const { error } = await supabase.storage.from(SOLAR_BUCKET).upload(objectPath, file.buffer, {
               contentType: file.mimetype,
