@@ -3585,11 +3585,6 @@ app.get('/options/reps', async (req, res) => {
       fetchPropertyOptions('setter'),
     ]);
 
-    // TEMPORARY debug log — remove once the rep list is understood.
-    // fetchPropertyOptions() returns the options array itself, so this is the
-    // raw HubSpot payload before repLabels() drops the blocklist and sorts.
-    console.log('[options/reps DEBUG] raw closer options:', JSON.stringify(closerOptions, null, 2));
-
     const payload = {
       closers: repLabels(closerOptions),
       setters: repLabels(setterOptions),
