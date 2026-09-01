@@ -4088,14 +4088,23 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
          * hand ops a dead link instead of no link.
          */
         if (documentsUrl) {
+          /*
+           * Logged on both sides of the call. This is the one write whose
+           * failure is invisible from the rep's side — the submission succeeds
+           * either way — so the log is the only place it surfaces.
+           */
+          console.log(`[solar-submission] writing intake_gdrive_link to deal ${dealId}: ${documentsUrl}`);
           try {
             assertSolarPipeline(SOLAR_PIPELINE);
+            // Awaited: the response below reports what actually landed, so it
+            // must not go out until this has either succeeded or failed.
             await hubspot(`/crm/v3/objects/deals/${dealId}`, {
               method: 'PATCH',
               body: JSON.stringify({ properties: { intake_gdrive_link: documentsUrl } }),
             });
+            console.log('[solar-submission] intake_gdrive_link written successfully');
           } catch (err) {
-            console.error('[solar-submission] could not write intake_gdrive_link:', err);
+            console.error('[solar-submission] intake_gdrive_link PATCH failed:', err && err.message ? err.message : err);
             warnings.push('Document archive URL was not written to the deal');
           }
         }
