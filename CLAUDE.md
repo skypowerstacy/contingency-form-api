@@ -25,7 +25,7 @@ Railway-hosted Node.js/Express API serving as the backend for all NuHome web for
 - POST /scope — updates existing roofing insurance deal to Scope Received stage (4109489903)
 - POST /retail-submission — creates HubSpot contact + deal in Roofing Retail pipeline (2477633213) at Intake stage (4106670802), uploads files to Supabase inspections bucket, emails misty@thenuhome.com and mariah@thenuhome.com
 - POST /solar-submission — creates HubSpot contact + deal in Operations pipeline (1022523097) at Intake stage (1578819287), uploads files to Supabase solar bucket, emails misty@thenuhome.com and mariah@thenuhome.com
-- GET /options/reps — fetches closer/setter enum options from HubSpot at runtime, 5-minute memory cache. No longer called by any frontend (solar-submission switched to free text inputs) but the cache is still used internally by /solar-submission enum matching — do not remove
+- GET /options/reps — fetches closer/setter enum options from HubSpot at runtime, 5-minute memory cache. Called by solar-submission.html on page load to populate closer and setter dropdowns with active, non-archived reps. Also used internally by /solar-submission endpoint for enum fuzzy matching.
 - GET /rep-deals — rep-facing deal lookup by fuzzy name match against closer/setter fields
 - POST /rep-deals/action — rep actions: note, adjuster, lost, retail
 - GET /admin-deals — admin deal summary, requires x-admin-token header matching ADMIN_TOKEN env var
