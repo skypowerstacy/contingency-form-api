@@ -3937,6 +3937,9 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
 
       if (/^\d{4}-\d{2}-\d{2}$/.test(fields.date_signed)) {
         setIf('date_signed', fields.date_signed);
+        // Same value under a second name — ops reports read one, the deal card
+        // shows the other, and both are expected to be populated.
+        setIf('signed_date', fields.date_signed);
         // Noon Denver, not midnight UTC — see denverNoonMs().
         const ms = denverNoonMs(fields.date_signed);
         if (ms !== null) setIf('closedate', ms);
