@@ -1207,7 +1207,11 @@ function inspectionReportData(fields, damageReport, checklist) {
   };
 }
 
-function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes) {
+/*
+ * reportUrl and dealId are optional and appended, never substituted — a caller
+ * that omits them gets exactly the email this built before they existed.
+ */
+function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes, reportUrl, dealId) {
   const rows = [
     ['Property address', fields.address],
     ['Homeowner', [fields.fname, fields.lname].filter(Boolean).join(' ')],
@@ -1244,12 +1248,34 @@ function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes)
     ? `<p style="margin:16px 0 0;font-size:13px"><a href="${escapeHtml(photosUrl)}" style="color:#C9922A">View ${photoCount} inspection photo${photoCount === 1 ? '' : 's'} →</a></p>`
     : `<p style="margin:16px 0 0;color:#6b7280;font-size:13px">${photoCount} photo${photoCount === 1 ? '' : 's'} received — storage link unavailable.</p>`;
 
+  /*
+   * The two things a reader most often wants are the report and the deal, so
+   * they sit above the field table rather than being hunted for below it. Each
+   * is omitted entirely when its value is absent — an empty row would read as
+   * a broken link.
+   */
+  const linkRow = (label, href, text) => `
+    <tr>
+      <td style="padding:6px 12px 6px 0;color:#6b7280;font-size:13px;white-space:nowrap">${escapeHtml(label)}</td>
+      <td style="padding:6px 0;font-size:13px"><a href="${escapeHtml(href)}" style="color:#C9922A;font-weight:600">${escapeHtml(text)}</a></td>
+    </tr>`;
+
+  const linkRows = [
+    reportUrl ? linkRow('Shareable Report Link', reportUrl, 'View Damage Report →') : '',
+    dealId ? linkRow('HubSpot Deal', `https://app.hubspot.com/contacts/deals/${dealId}`, 'Open Deal →') : '',
+  ].join('');
+
+  const linkBlock = linkRows
+    ? `<table style="width:100%;border-collapse:collapse;margin:0 0 20px;padding-bottom:16px;border-bottom:1px solid #e5e7eb">${linkRows}</table>`
+    : '';
+
   return `
     <div style="font-family: sans-serif; max-width: 640px; margin: 0 auto;">
       <div style="background:#1B2A4A;padding:24px;border-radius:8px 8px 0 0">
         <h1 style="color:#C9922A;margin:0;font-size:20px">NuHome — Site Inspection Submitted</h1>
       </div>
       <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-radius:0 0 8px 8px">
+        ${linkBlock}
         <table style="width:100%;border-collapse:collapse">${rows}</table>
         ${photoBlock}
         <h2 style="font-size:14px;margin:24px 0 8px;color:#111827">Damage report</h2>
@@ -1258,6 +1284,16 @@ function inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes)
       </div>
     </div>
   `;
+}
+
+/*
+ * The rep's copy of the inspection email. Identical output today, and a
+ * separate function on purpose: the rep and ops audiences will diverge — ops
+ * wants warnings and the HubSpot deal, the rep mostly wants the report — and
+ * splitting them later should not mean untangling one shared builder.
+ */
+function repInspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes, reportUrl, dealId) {
+  return inspectionEmailHtml(fields, damageReport, photosUrl, photoCount, notes, reportUrl, dealId);
 }
 
 app.post('/inspection', upload.any(), async (req, res) => {
@@ -1447,7 +1483,7 @@ app.post('/inspection', upload.any(), async (req, res) => {
         from: 'NuHome Forms <noreply@thehiveoffice.com>',
         to: ['stacy@thenuhome.com'],
         subject: `New Inspection Submitted — ${[fields.fname, fields.lname].filter(Boolean).join(' ') || 'Unknown'} | ${fields.address || 'No address'}`,
-        html: inspectionEmailHtml(fields, damageReport, photosUrl, photos.length, notes),
+        html: inspectionEmailHtml(fields, damageReport, photosUrl, photos.length, notes, reportUrl, dealId),
       });
     } catch (err) {
       console.error('[inspection] ops email failed:', err);
@@ -2415,6 +2451,14 @@ function retailEmailHtml(fields, sectionUrls, dealId, warnings) {
   `;
 }
 
+/*
+ * The rep's copy of the retail email. Identical output today; separate for the
+ * same reason as repInspectionEmailHtml.
+ */
+function repRetailEmailHtml(fields, sectionUrls, dealId, warnings) {
+  return retailEmailHtml(fields, sectionUrls, dealId, warnings);
+}
+
 app.post('/retail-submission', upload.any(), async (req, res) => {
   /*
    * Drop files over the per-file cap and keep going, same as /inspection:
@@ -2584,6 +2628,91 @@ app.post('/retail-submission', upload.any(), async (req, res) => {
       dealId,
       warnings,
     });
+  }
+});
+
+// ===========================================================================
+// POST /send-rep-copy — emails the rep their own copy of a submission
+//
+// Optional and after the fact: the submission has already landed by the time
+// this is called, so nothing here can affect whether it succeeded. A failure
+// costs the rep a convenience email and nothing else.
+// ===========================================================================
+
+app.post('/send-rep-copy', async (req, res) => {
+  try {
+    const formType = (req.body?.formType ?? '').toString().trim();
+    const repEmail = (req.body?.repEmail ?? '').toString().trim();
+
+    // Deliberately loose. This is a convenience send to an address the rep just
+    // typed about themselves — a strict pattern would reject valid addresses
+    // more often than it would catch a mistake.
+    if (!repEmail || !repEmail.includes('@')) {
+      return res.status(400).json({ error: 'A valid repEmail is required.' });
+    }
+
+    const fields = (req.body?.fields && typeof req.body.fields === 'object') ? req.body.fields : {};
+    const dealId = req.body?.dealId ? String(req.body.dealId) : null;
+    const warnings = Array.isArray(req.body?.warnings) ? req.body.warnings.map(String) : [];
+
+    let subject;
+    let html;
+
+    if (formType === 'inspection') {
+      const notes = Array.isArray(req.body?.notes) ? req.body.notes.map(String) : [];
+      const photoCount = Number.isFinite(Number(req.body?.photoCount)) ? Number(req.body.photoCount) : 0;
+      const customerName = [fields.fname, fields.lname].filter(Boolean).join(' ') || 'Unknown';
+
+      subject = `Your NuHome Inspection — ${customerName} | ${fields.address || 'No address'}`;
+      html = repInspectionEmailHtml(
+        fields,
+        (req.body?.damageReport ?? '').toString(),
+        req.body?.photosUrl || null,
+        photoCount,
+        notes,
+        req.body?.reportUrl || null,
+        dealId
+      );
+    } else if (formType === 'retail') {
+      const raw = (req.body?.sectionUrls && typeof req.body.sectionUrls === 'object') ? req.body.sectionUrls : {};
+      // retailEmailHtml indexes this by RETAIL_SECTIONS[].field, so the keys
+      // have to be those exact names or every document link reads "unavailable".
+      const sectionUrls = {
+        measurement_report: raw.measurement_report || null,
+        signed_estimate: raw.signed_estimate || null,
+        site_photos: raw.site_photos || null,
+      };
+
+      subject = `Your NuHome Submission — ${fields.customerName || 'Unknown'} | ${fields.propertyAddress || 'No address'}`;
+      html = repRetailEmailHtml(fields, sectionUrls, dealId, warnings);
+    } else {
+      return res.status(400).json({ error: "formType must be 'inspection' or 'retail'." });
+    }
+
+    // The rep only — this never copies ops, who already received their own.
+    const sent = await resend.emails.send({
+      from: 'NuHome Forms <noreply@thehiveoffice.com>',
+      to: [repEmail],
+      subject,
+      html,
+    });
+
+    /*
+     * The SDK reports API failures as { data: null, error } rather than
+     * throwing, so the surrounding catch never sees a rejected address, a rate
+     * limit, or a suppressed recipient. Unchecked, this route would answer
+     * "sent" for an email that was not — and the rep's only signal that their
+     * copy exists is that answer.
+     */
+    if (sent && sent.error) {
+      throw new Error(sent.error.message || 'Resend rejected the message');
+    }
+
+    console.log('[send-rep-copy] sent', formType, 'copy to', repEmail, '- deal', dealId);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[send-rep-copy] failed:', err);
+    return res.status(500).json({ error: 'Failed to send email' });
   }
 });
 
