@@ -3379,6 +3379,7 @@ app.post('/rep-deals/action', async (req, res) => {
 const SOLAR_PIPELINE = '1022523097';
 const SOLAR_STAGE = '1578819287'; // Intake
 const SOLAR_BUCKET = 'solar';
+const SOLAR_ZIP_NAME = 'solar-documents.zip';
 
 /**
  * The counterpart to assertPipelineAllowed() for this one route: where that
@@ -3676,7 +3677,7 @@ function solarNumber(value) {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function solarEmailHtml(fields, folderUrl, dealId, skipped, warnings) {
+function solarEmailHtml(fields, documents, dealId, skipped, warnings) {
   const row = (label, value) => `
     <tr>
       <td style="padding:6px 12px 6px 0;color:#6b7280;font-size:13px;vertical-align:top;white-space:nowrap">${escapeHtml(label)}</td>
@@ -3736,9 +3737,20 @@ function solarEmailHtml(fields, folderUrl, dealId, skipped, warnings) {
     hoaRows.push(row('HOA contact info', fields.hoa_contact));
   }
 
-  const docsBlock = folderUrl
-    ? `<p style="margin:8px 0;font-size:13px"><a href="${escapeHtml(folderUrl)}" style="color:#C9922A">View Uploaded Documents →</a></p>`
-    : `<p style="margin:8px 0;color:#6b7280;font-size:13px">Documents were not uploaded to storage.</p>`;
+  /*
+   * The zip is the link ops gets. When zipping failed the files are still in
+   * storage individually, so the names are listed instead — ops can at least
+   * see what was submitted and pull them from Supabase by hand.
+   */
+  const docNames = (documents && documents.names) || [];
+  const docsBlock = documents && documents.url
+    ? `<p style="margin:8px 0;font-size:13px"><a href="${escapeHtml(documents.url)}" style="color:#C9922A">View Uploaded Documents →</a></p>`
+    : docNames.length
+      ? `<p style="margin:8px 0;color:#b45309;font-size:13px">The document archive could not be built. These files were uploaded individually:</p>
+         <ul style="margin:8px 0;padding-left:20px;color:#111827;font-size:13px">${
+           docNames.map(n => `<li>${escapeHtml(n)}</li>`).join('')
+         }</ul>`
+      : `<p style="margin:8px 0;color:#6b7280;font-size:13px">Documents were not uploaded to storage.</p>`;
 
   const notes = table([
     row('Customer expectations / special project notes', fields.special_project_notes),
@@ -3790,7 +3802,11 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
   const skipped = [];
   let dealId = null;
   let contactId = null;
-  let folderUrl = null;
+  // Public URL of the document zip, once it exists. Null until then.
+  let documentsUrl = null;
+  // Zip-relative names of everything that reached storage, for the email's
+  // fallback list when the archive itself could not be built.
+  let uploadedNames = [];
   let fields = {};
 
   try {
@@ -4000,6 +4016,9 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
           }
         };
 
+        // Only what actually reached storage goes into the archive.
+        const stored = [];
+
         await Promise.all(acceptedFiles.map(async (file) => {
           const safeName = String(file.originalname || 'document').replace(/[^\w.\-]/g, '_');
           const objectPath = uniquePath(file.fieldname, safeName);
@@ -4009,6 +4028,15 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
               upsert: true,
             });
             if (error) failed.push(`${objectPath}: ${error.message}`);
+            /*
+             * The zip entry name is the object path minus the deal id, so the
+             * archive mirrors the storage layout exactly — {fieldname}/{name},
+             * already sanitised and de-duplicated by uniquePath(). Reusing it
+             * matters: two site maps both called image.jpg would otherwise
+             * become two identically-named zip entries, and most extractors
+             * keep only one of those.
+             */
+            else stored.push({ name: objectPath.slice(dealId.length + 1), buffer: file.buffer });
           } catch (err) {
             failed.push(`${objectPath}: ${err.message || err}`);
           }
@@ -4019,17 +4047,51 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
           warnings.push(`${failed.length} document(s) failed to upload`);
         }
 
-        if (failed.length < acceptedFiles.length) {
-          folderUrl = `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${SOLAR_BUCKET}/${dealId}/`;
+        uploadedNames = stored.map(entry => entry.name);
+
+        /*
+         * One zip, because a Supabase public URL cannot list a folder — the
+         * {dealId}/ link this used to write 404s when ops clicks it. The zip is
+         * a real object at a real URL.
+         *
+         * Best effort: a failure here costs the convenience link, not the
+         * submission. The files are already in storage individually, and the
+         * email falls back to naming them.
+         */
+        if (stored.length) {
+          try {
+            const zipBuffer = await zipEntries(stored);
+            const zipPath = `${dealId}/${SOLAR_ZIP_NAME}`;
+            const { error } = await supabase.storage.from(SOLAR_BUCKET).upload(zipPath, zipBuffer, {
+              contentType: 'application/zip',
+              upsert: true,
+            });
+            if (error) throw new Error(error.message);
+
+            documentsUrl =
+              `https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/object/public/${SOLAR_BUCKET}/${zipPath}`;
+            console.log('[solar-submission] zipped', stored.length, 'document(s):', zipBuffer.length, 'bytes ->', zipPath);
+          } catch (err) {
+            console.error('[solar-submission] document zip failed:', err);
+            warnings.push('Document archive could not be built — files are in storage individually');
+          }
+        }
+
+        /*
+         * Only written when there is a working link to write. The old folder
+         * URL 404s, so putting it on the deal when the zip fails would just
+         * hand ops a dead link instead of no link.
+         */
+        if (documentsUrl) {
           try {
             assertSolarPipeline(SOLAR_PIPELINE);
             await hubspot(`/crm/v3/objects/deals/${dealId}`, {
               method: 'PATCH',
-              body: JSON.stringify({ properties: { intake_gdrive_link: folderUrl } }),
+              body: JSON.stringify({ properties: { intake_gdrive_link: documentsUrl } }),
             });
           } catch (err) {
             console.error('[solar-submission] could not write intake_gdrive_link:', err);
-            warnings.push('Document folder URL was not written to the deal');
+            warnings.push('Document archive URL was not written to the deal');
           }
         }
       } catch (err) {
@@ -4047,7 +4109,7 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
         from: 'NuHome Forms <noreply@thehiveoffice.com>',
         to: ['mariah@thenuhome.com', 'misty@thenuhome.com'],
         subject: `New Solar Submission — ${[fields.firstname, fields.lastname].filter(Boolean).join(' ') || 'Unknown'} | ${fields.customers_full_address || 'No address'}`,
-        html: solarEmailHtml(fields, folderUrl, dealId, skipped, warnings),
+        html: solarEmailHtml(fields, { url: documentsUrl, names: uploadedNames }, dealId, skipped, warnings),
       });
     } catch (err) {
       console.error('[solar-submission] ops email failed:', err);
@@ -4057,7 +4119,10 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
     return res.json({
       success: true,
       dealId,
-      folderUrl,
+      zipUrl: documentsUrl,
+      // Kept under its original name too: the deployed form reads folderUrl for
+      // its "View uploaded documents" link and would lose it on a rename.
+      folderUrl: documentsUrl,
       ...(skipped.length ? { skippedFields: skipped } : {}),
       ...(warnings.length ? { warnings } : {}),
     });
@@ -4068,7 +4133,8 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
       success: false,
       error: err.message || 'Solar submission failed.',
       dealId,
-      folderUrl,
+      zipUrl: documentsUrl,
+      folderUrl: documentsUrl,
     });
   }
 });
