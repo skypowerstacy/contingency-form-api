@@ -3488,6 +3488,32 @@ async function resolveEnumValue(propertyName, submitted) {
   const exact = options.find(o => normaliseName(o.value) === normaliseName(raw));
   if (exact) return { value: exact.value, skipped: false, score: 1 };
 
+  /*
+   * A bare first name beats a bigram score outright.
+   *
+   * "Jackson" scored 0.71 against "Colton Jackson" and was picked over
+   * "Jackson Stuart" — the rep whose first name it actually is. Character
+   * bigrams cannot tell a first name from a last name, so the whole word is
+   * checked against the option's first token before scoring is consulted at
+   * all. Ties among several same-first-name options fall back to the bigram
+   * score between them, which is what distinguishes the surnames.
+   */
+  const firstNameMatches = options.filter(
+    o => normaliseName(String(o.value || '').trim().split(/\s+/)[0]) === normaliseName(raw)
+  );
+  if (firstNameMatches.length) {
+    let pick = firstNameMatches[0];
+    let pickScore = enumScore(raw, pick.value);
+    for (const option of firstNameMatches.slice(1)) {
+      const score = enumScore(raw, option.value);
+      if (score > pickScore) {
+        pickScore = score;
+        pick = option;
+      }
+    }
+    return { value: pick.value, skipped: false, score: pickScore, matchedOn: 'first-name' };
+  }
+
   let best = null;
   let bestScore = 0;
   for (const option of options) {
@@ -3580,6 +3606,67 @@ const SOLAR_TEXT_FIELDS = [
   'adders', 'additional_adders', 'hoa', 'hoa_contact',
   'special_project_notes', 'additional_notes', 'how_heard',
 ];
+
+/*
+ * Reps and the office are all on Mountain Time, so a close date is a Denver
+ * calendar date. Midnight UTC is the previous evening in Denver, which is why
+ * closedate was showing a day early — the instant was correct, the calendar day
+ * HubSpot rendered was not.
+ *
+ * Noon is used rather than midnight because it is the furthest point from a DST
+ * transition (those land at 2am), so the date can never slip in either
+ * direction no matter which side of a changeover it falls on.
+ */
+const SOLAR_TIMEZONE = 'America/Denver';
+
+/**
+ * Milliseconds to add to an instant to get the wall-clock time in `timeZone`,
+ * read as if it were UTC. Negative west of Greenwich.
+ */
+function zoneOffsetMs(instantMs, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(new Date(instantMs)).reduce((acc, part) => {
+    acc[part.type] = part.value;
+    return acc;
+  }, {});
+
+  const wallAsUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    // Intl renders midnight as "24" in some locales under hour12:false.
+    Number(parts.hour) % 24,
+    Number(parts.minute),
+    Number(parts.second)
+  );
+  return wallAsUtc - instantMs;
+}
+
+/**
+ * Unix milliseconds for noon America/Denver on a YYYY-MM-DD date.
+ * Returns null when the string is not a valid date.
+ *
+ * Two passes: the first guess uses the offset in force at the same wall clock
+ * read as UTC, the second re-reads the offset at that corrected instant. That
+ * settles any date where the offset differs between the two, which noon never
+ * does in practice but costs nothing to be right about.
+ */
+function denverNoonMs(ymd) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+  if (!match) return null;
+
+  const [, y, m, d] = match.map(Number);
+  const wallAsUtc = Date.UTC(y, m - 1, d, 12, 0, 0);
+  if (!Number.isFinite(wallAsUtc)) return null;
+
+  let instant = wallAsUtc - zoneOffsetMs(wallAsUtc, SOLAR_TIMEZONE);
+  instant = wallAsUtc - zoneOffsetMs(instant, SOLAR_TIMEZONE);
+  return Number.isFinite(instant) ? instant : null;
+}
 
 /** Number, or undefined when the field was blank or unparseable. */
 function solarNumber(value) {
@@ -3827,9 +3914,9 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
 
       if (/^\d{4}-\d{2}-\d{2}$/.test(fields.date_signed)) {
         setIf('date_signed', fields.date_signed);
-        // HubSpot date properties are midnight UTC in epoch milliseconds.
-        const ms = Date.parse(`${fields.date_signed}T00:00:00Z`);
-        if (Number.isFinite(ms)) setIf('closedate', ms);
+        // Noon Denver, not midnight UTC — see denverNoonMs().
+        const ms = denverNoonMs(fields.date_signed);
+        if (ms !== null) setIf('closedate', ms);
       } else if (fields.date_signed) {
         console.warn('[solar-submission] date_signed not YYYY-MM-DD, skipping:', fields.date_signed);
         skipped.push({ property: 'date_signed', submitted: fields.date_signed, reason: 'not a YYYY-MM-DD date' });
