@@ -4125,9 +4125,6 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
       success: true,
       dealId,
       zipUrl: documentsUrl,
-      // Kept under its original name too: the deployed form reads folderUrl for
-      // its "View uploaded documents" link and would lose it on a rename.
-      folderUrl: documentsUrl,
       ...(skipped.length ? { skippedFields: skipped } : {}),
       ...(warnings.length ? { warnings } : {}),
     });
@@ -4139,7 +4136,6 @@ app.post('/solar-submission', upload.fields(SOLAR_FILE_FIELDS.map(f => ({ name: 
       error: err.message || 'Solar submission failed.',
       dealId,
       zipUrl: documentsUrl,
-      folderUrl: documentsUrl,
     });
   }
 });
